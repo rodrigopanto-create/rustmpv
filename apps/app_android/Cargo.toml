@@ -1,0 +1,54 @@
+[package]
+name = "app_android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = ["chaquopy"]
+chaquopy = []
+native-python = []
+yt-dlp-subprocess = []
+
+[dependencies]
+core_logic.workspace = true
+eframe.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+log = "0.4"
+url = "2"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity = { version = "0.6.1", features = ["native-activity"] }
+eframe = { workspace = true, features = ["android-native-activity"] }
+jni = "0.22"
+ndk-context = "0.1"
+winit = "0.30"
+reqwest = { version = "0.11", default-features = false, features = ["blocking", "json", "rustls-tls-webpki-roots"] }
+android_logger = "0.14"
+libc = "0.2"
+
+[package.metadata.android]
+package = "com.visualrustmpv.app"
+apk_name = "visualrustmpv"
+build_targets = ["aarch64-linux-android"]
+runtime_libs = "../../assets/android"
+assets = "../../android/app/src/main/assets"
+
+# cargo-apk reads the android table above. This explicit target alias documents
+# the intended APK architecture for tooling which exposes package.metadata.apk.
+[package.metadata.apk]
+target = "aarch64-linux-android"
+
+[package.metadata.android.sdk]
+min_sdk_version = 24
+target_sdk_version = 36
+
+[package.metadata.android.application]
+extract_native_libs = true
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"

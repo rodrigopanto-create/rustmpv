@@ -1,0 +1,22 @@
+[workspace]
+members = [
+    "crates/core_logic",
+    "apps/app_windows",
+    "apps/app_android",
+]
+resolver = "2"
+exclude = ["vendor/egui-winit"]
+
+[patch.crates-io]
+egui-winit = { path = "vendor/egui-winit" }
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+core_logic = { path = "crates/core_logic" }
+eframe = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

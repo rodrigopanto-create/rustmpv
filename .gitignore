@@ -1,0 +1,18 @@
+/target
+/android/.gradle/
+/android/app/build/
+/android/app/src/main/jniLibs/
+/android/local.properties
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Third-party binaries: Windows tools for the optional embedded-tools/embedded-mpv
+# features, and Android libraries that build-android-chaquopy.ps1 downloads again.
+/assets/*.exe
+/assets/*.dll
+/assets/android/**/*.so
+
+# User data written by the desktop app at runtime
+/visualrustmpv_playlist.json

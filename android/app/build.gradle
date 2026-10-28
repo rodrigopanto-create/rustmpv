@@ -1,0 +1,70 @@
+plugins {
+    id "com.android.application"
+    id "com.chaquo.python"
+}
+
+android {
+    namespace "com.visualrustmpv.app"
+    compileSdk 36
+
+    defaultConfig {
+        applicationId "com.visualrustmpv.app"
+        minSdk 24
+        targetSdk 36
+        versionCode 1
+        versionName "0.1.0"
+
+        ndk {
+            abiFilters "arm64-v8a"
+        }
+    }
+
+    sourceSets {
+        main {
+            assets.srcDir layout.buildDirectory.dir("generated/quickjsAssets")
+            jniLibs.srcDirs = [
+                "src/main/jniLibs",
+                "../../assets/android"
+            ]
+        }
+    }
+
+    androidResources {
+        ignoreAssetsPatterns.addAll(["yt-dlp", "python-runtime"])
+    }
+
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging = true
+            excludes += ["**/libpython_exec.so", "**/libyt_dlp_exec.so"]
+        }
+    }
+}
+
+chaquopy {
+    defaultConfig {
+        version "3.13"
+        def hostPython = System.getenv("CHAQUOPY_BUILD_PYTHON")
+        if (hostPython) {
+            buildPython hostPython
+        }
+        pip {
+            install "yt-dlp==2026.10.26"
+            install "yt-dlp-ejs==0.8.0"
+            install "certifi"
+        }
+    }
+}
+
+tasks.register("verifyQuickJs") {
+    doLast {
+        def runtime = file("src/main/jniLibs/arm64-v8a/libqjs.so")
+        def license = layout.buildDirectory.file("generated/quickjsAssets/licenses/quickjs-ng.txt").get().asFile
+        if (!runtime.isFile() || !license.isFile()) {
+            throw new GradleException("Falta QuickJS-ng o su licencia. Ejecuta build-android-chaquopy.ps1 desde la raiz.")
+        }
+    }
+}
+tasks.named("preBuild").configure {
+    dependsOn("verifyQuickJs")
+}
