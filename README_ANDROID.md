@@ -7,6 +7,31 @@ library for `aarch64-linux-android`. Run from the repository root, not `.git`.
 .\build-android-chaquopy.ps1
 ```
 
+## Distribution APK
+
+The launcher has an adaptive icon (and a vector fallback for Android 7.0/7.1),
+including a monochrome Android 13 themed icon. The application label is
+`VisualRustMPV`; Android 12+ also uses its launcher icon for the system splash.
+
+Create a signed arm64 APK with:
+
+```powershell
+.\build-android-release.ps1
+```
+
+The first run generates a local PKCS#12 release key outside the repository at
+`%LOCALAPPDATA%\VisualRustMPV\signing\`. Its password is encrypted with Windows
+DPAPI for the current Windows account. The script builds the `release` variant,
+verifies APK signing and 16 KiB native-library alignment, then copies the
+installable artifact to `dist/VisualRustMPV-v0.1.0-arm64-v8a.apk` and prints
+its SHA-256. It does not install over the development build.
+
+**Back up `visualrustmpv-release.p12` securely.** Every future release must use
+this same key to upgrade installations without removing app data. The DPAPI
+password file only decrypts under the same Windows account; keep it alongside
+the key backup or make a separate secure backup of the password. Never commit
+the keystore or password.
+
 ## Native binaries
 
 The Windows files in `assets/` (`mpv.exe`, `yt-dlp.exe` and `ffmpeg.exe`) are never used by Android.

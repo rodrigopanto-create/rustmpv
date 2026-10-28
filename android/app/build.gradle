@@ -19,6 +19,25 @@ android {
         }
     }
 
+    signingConfigs {
+        release {
+            def signingStore = System.getenv("VISUALRUSTMPV_KEYSTORE")
+            if (signingStore) {
+                storeFile file(signingStore)
+                storePassword System.getenv("VISUALRUSTMPV_KEYSTORE_PASSWORD")
+                keyAlias System.getenv("VISUALRUSTMPV_KEY_ALIAS")
+                keyPassword System.getenv("VISUALRUSTMPV_KEY_PASSWORD")
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            signingConfig signingConfigs.release
+            minifyEnabled false
+        }
+    }
+
     sourceSets {
         main {
             assets.srcDir layout.buildDirectory.dir("generated/quickjsAssets")

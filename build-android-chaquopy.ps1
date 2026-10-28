@@ -1,3 +1,8 @@
+param(
+    [ValidateSet("Debug", "Release")]
+    [string]$Variant = "Debug"
+)
+
 # Prepara mpv-android y QuickJS-ng y ensambla el APK Gradle con Chaquopy.
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
@@ -133,9 +138,10 @@ Copy-Item (Join-Path $quickJsSource "LICENSE") (Join-Path $quickJsLicenses "quic
 
 cargo ndk -t arm64-v8a --platform 24 -o "android\app\src\main\jniLibs" build -p app_android --release --lib --no-default-features --features chaquopy
 if ($LASTEXITCODE -ne 0) { throw "Fallo la compilacion Rust para Chaquopy." }
-& $gradle -p android :app:assembleDebug --console=plain --no-daemon --max-workers=2
+& $gradle -p android ":app:assemble$Variant" --console=plain --no-daemon --max-workers=2
 if ($LASTEXITCODE -ne 0) { throw "Fallo el empaquetado Gradle/Chaquopy." }
-$outputApk = Join-Path $PSScriptRoot "android\app\build\outputs\apk\debug\app-debug.apk"
+$variantPath = $Variant.ToLowerInvariant()
+$outputApk = Join-Path $PSScriptRoot "android\app\build\outputs\apk\$variantPath\app-$variantPath.apk"
 $archive = [System.IO.Compression.ZipFile]::OpenRead($outputApk)
 try {
     $entries = $archive.Entries.FullName
@@ -175,5 +181,5 @@ try {
 finally {
     $archive.Dispose()
 }
-Write-Host "APK: android/app/build/outputs/apk/debug/app-debug.apk"
+Write-Host "APK: $outputApk"
 Write-Host "Verificado: un solo runtime Python, sin assets Python de subproceso; QuickJS-ng y EJS incluidos."

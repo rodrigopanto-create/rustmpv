@@ -16,3 +16,6 @@ __pycache__/
 
 # User data written by the desktop app at runtime
 /visualrustmpv_playlist.json
+
+# Local distribution builds and signing material are never committed.
+/dist/

@@ -8,6 +8,8 @@
     <application
         android:name="com.chaquo.python.android.PyApplication"
         android:label="VisualRustMPV"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
         <service
             android:name=".PlaybackService"
