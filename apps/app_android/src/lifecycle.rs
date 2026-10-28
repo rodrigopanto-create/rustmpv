@@ -72,6 +72,8 @@ mod native {
         };
         let mut playback = playback.lock().expect("playback lock");
         playback.poll(state.context);
+        // Keeps resume positions current while the UI is not drawing (screen locked).
+        crate::history::observe(&playback);
         i64::from(playback.active)
             | (i64::from(playback.paused) << 1)
             | (i64::from(playback.loaded) << 2)

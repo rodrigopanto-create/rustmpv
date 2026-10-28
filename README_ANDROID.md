@@ -178,6 +178,32 @@ without changing machine-wide policy. It explicitly builds
 `app_android` with `chaquopy`; the manifest loads `libapp_android.so`.
 `cargo-apk` alone does not include the Java/Python pieces required by Chaquopy.
 
+## History and resume
+
+`apps/app_android/src/history.rs` keeps the last 50 items in
+`files/history.json`: title, channel, mode, position and duration. A YouTube
+video uses its ID as the key, so `watch?v=`, `youtu.be`, `shorts` and `live`
+links share one resume position. Progress is saved after every 5 s of playback
+change, once when paused, and on stop or end. It is saved from
+`PlaybackService.nativeTick` too, so it keeps working with the screen locked.
+Writes go to a temporary file followed by a rename. A corrupt file starts an
+empty history.
+
+Playing an item again passes `start=<s>` to `loadfile` and shows
+`Reanudando en m:ss`. There is no resume:
+- before 15 s;
+- within 15 s or 5 % of the end, where the item counts as watched;
+- for items without a finite duration (live streams).
+
+The list below the player can be tapped to replay with the saved mode; each item
+has a remove button, and "Borrar todo" asks for confirmation.
+
+Verified on the device with Big Buck Bunny:
+- Stopping at 44.6 s and force-stopping the app still showed
+  `continuar en 0:44 / 10:34`; tapping the item resumed at `time-pos=44.64s`.
+- With the screen off, the file kept advancing (96.9 s) up to when the process
+  was killed.
+
 ## Optional yt-dlp subprocess backend
 
 The `yt-dlp-subprocess` feature in [app_android](apps/app_android/README.md)

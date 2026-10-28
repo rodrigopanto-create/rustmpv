@@ -27,6 +27,8 @@ mod chaquopy;
 #[cfg(any(target_os = "android", test))]
 mod controls;
 #[cfg(any(target_os = "android", test))]
+mod history;
+#[cfg(any(target_os = "android", test))]
 mod lifecycle;
 #[cfg(any(target_os = "android", test))]
 mod playback;
@@ -101,6 +103,9 @@ struct AndroidAppState {
     /// Mantiene en la cola del worker una precarga que Play adopto.
     #[cfg(feature = "chaquopy")]
     stream_token: Option<std::sync::Arc<()>>,
+    history: Vec<history::Entry>,
+    history_revision: u64,
+    confirm_clear: bool,
 }
 
 #[cfg(target_os = "android")]
@@ -132,6 +137,7 @@ impl AndroidAppState {
                 (None, Some(error))
             }
         };
+        history::init(android_app.internal_data_path().as_deref());
         let playback = lifecycle::register(mpv_context);
         #[cfg(feature = "chaquopy")]
         if let Err(error) = chaquopy::start_worker() {
@@ -162,6 +168,9 @@ impl AndroidAppState {
             prefetch: prefetch::Prefetcher::default(),
             #[cfg(feature = "chaquopy")]
             stream_token: None,
+            history: Vec::new(),
+            history_revision: 0,
+            confirm_clear: false,
         }
     }
 }
@@ -220,6 +229,7 @@ impl eframe::App for AndroidAppState {
         let playback = {
             let mut playback = self.playback.lock().expect("playback lock");
             playback.poll(self.mpv_context);
+            history::observe(&playback);
             if let Some(video) = &self.video {
                 let error = video.lock().expect("video renderer lock").error.clone();
                 if let Some(error) = error.as_ref().filter(|_| self.video_error.is_none()) {
@@ -370,6 +380,7 @@ impl eframe::App for AndroidAppState {
                         ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
                     self.draw_video(ui, rect);
                 }
+                self.draw_history(ui);
             });
         if self.mpv_context != 0 {
             let interval = if self.playing_mode == PlaybackMode::Video {
@@ -488,6 +499,95 @@ impl AndroidAppState {
         });
     }
 
+    fn draw_history(&mut self, ui: &mut egui::Ui) {
+        let revision = history::revision();
+        if revision != self.history_revision {
+            self.history = history::entries();
+            self.history_revision = revision;
+        }
+        if self.history.is_empty() {
+            return;
+        }
+        ui.separator();
+        let mut play = None;
+        let mut remove = None;
+        ui.horizontal(|ui| {
+            ui.strong("Historial");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.confirm_clear {
+                    if ui.small_button("Cancelar").clicked() {
+                        self.confirm_clear = false;
+                    }
+                    if ui.small_button("Sí, borrar").clicked() {
+                        self.confirm_clear = false;
+                        history::clear();
+                    }
+                } else if ui.small_button("Borrar todo").clicked() {
+                    self.confirm_clear = true;
+                }
+            });
+        });
+        let enabled = self.stream_receiver.is_none();
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for entry in &self.history {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("🗙").on_hover_text("Quitar").clicked() {
+                            remove = Some(entry.key.clone());
+                        }
+                        ui.vertical(|ui| {
+                            let title = ui.add_enabled(
+                                enabled,
+                                egui::Label::new(entry.label())
+                                    .truncate()
+                                    .sense(egui::Sense::click()),
+                            );
+                            let duration = entry.duration.filter(|value| value.is_finite());
+                            let progress = if entry.finished() {
+                                "visto".to_owned()
+                            } else if let (Some(position), Some(duration)) =
+                                (entry.resume_position(), duration)
+                            {
+                                format!(
+                                    "continuar en {} / {}",
+                                    controls::clock(position),
+                                    controls::clock(duration)
+                                )
+                            } else {
+                                duration.map(controls::clock).unwrap_or_default()
+                            };
+                            let mode = if entry.audio_only { "Audio" } else { "Video" };
+                            let details = [mode, entry.artist.as_str(), progress.as_str()]
+                                .into_iter()
+                                .filter(|part| !part.is_empty())
+                                .collect::<Vec<_>>()
+                                .join(" · ");
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(details).weak().small())
+                                    .truncate(),
+                            );
+                            if title.clicked() {
+                                play = Some((entry.input.clone(), entry.audio_only));
+                            }
+                        });
+                    });
+                }
+            });
+        if let Some(key) = remove {
+            history::remove(&key);
+        }
+        if let Some((input, audio_only)) = play {
+            self.url = input;
+            self.mode = if audio_only {
+                PlaybackMode::Audio
+            } else {
+                PlaybackMode::Video
+            };
+            self.resolve_and_play();
+        }
+    }
+
     fn draw_video(&self, ui: &egui::Ui, rect: egui::Rect) {
         ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
         if let Some(video) = &self.video {
@@ -522,12 +622,23 @@ impl AndroidAppState {
     fn load_resolved_stream(&mut self, media: stream_url::MediaInfo) {
         let mut playback = self.playback.lock().expect("playback lock");
         playback.poll(self.mpv_context);
-        match load_stream(self.mpv_context, &media.url, self.mode) {
+        // Records the previous item's last position before switching.
+        history::observe(&playback);
+        let resume = history::start(
+            self.url.trim(),
+            self.mode == PlaybackMode::Audio,
+            &media.title,
+            &media.artist,
+        );
+        match load_stream(self.mpv_context, &media.url, self.mode, resume) {
             Ok(()) => {
                 playback.loading();
                 self.playing_mode = self.mode;
                 self.seek_position = None;
-                self.status = playback.status();
+                self.status = match resume {
+                    Some(position) => format!("Reanudando en {}", controls::clock(position)),
+                    None => playback.status(),
+                };
                 drop(playback);
                 lifecycle::set_video(self.mode == PlaybackMode::Video);
                 self.service_request =
@@ -1294,19 +1405,30 @@ fn android_native_library_dir() -> Result<std::path::PathBuf, String> {
 
 /// Envía la URL directa a libmpv usando el comando loadfile.
 #[cfg(target_os = "android")]
-fn load_stream(context: usize, stream_url: &str, mode: PlaybackMode) -> Result<(), String> {
+fn load_stream(
+    context: usize,
+    stream_url: &str,
+    mode: PlaybackMode,
+    start: Option<f64>,
+) -> Result<(), String> {
     let stream_url = stream_url::validate_stream_url(stream_url)?;
-    let video_option = if mode == PlaybackMode::Video {
-        "vid=auto"
+    let mut options = if mode == PlaybackMode::Video {
+        "vid=auto".to_owned()
     } else {
-        "vid=no"
+        "vid=no".to_owned()
     };
+    if let Some(start) = start {
+        options.push_str(&format!(",start={start:.3}"));
+    }
     send_mpv_command(context, &["set", "pause", "no"])?;
     send_mpv_command(
         context,
-        &["loadfile", &stream_url, "replace", "-1", video_option],
+        &["loadfile", &stream_url, "replace", "-1", &options],
     )?;
-    log::info!("URL directa enviada a libmpv mediante loadfile ({mode:?})");
+    log::info!(
+        "URL directa enviada a libmpv mediante loadfile ({mode:?}, inicio {})",
+        start.map_or("0".to_owned(), |start| format!("{start:.1} s"))
+    );
     Ok(())
 }
 

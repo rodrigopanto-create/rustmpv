@@ -187,6 +187,34 @@ funciono sin agregar otro puente JNI. Si OpenSL ES no esta disponible, el
 error se comunica: no se elige una salida nula. `ytdl=no` impide que mpv intente
 ejecutar su propio extractor, y `network-timeout=15` limita esperas de red.
 
+### Historial y reanudacion
+
+`src/history.rs` guarda los ultimos 50 elementos en `files/history.json`:
+titulo, canal, modo, posicion y duracion. En YouTube la clave es el ID del
+video, asi que `watch?v=`, `youtu.be`, `shorts` y `live` comparten posicion.
+
+La posicion se guarda:
+- cada 5 s de avance;
+- una vez al pausar;
+- al detener o terminar;
+- tambien desde `nativeTick` del servicio, asi que funciona con la pantalla
+  bloqueada.
+
+Al volver a reproducir, `loadfile` recibe `start=<s>` y el estado muestra
+`Reanudando en m:ss`. No se reanuda:
+- antes de 15 s;
+- cerca del final (ultimos 15 s o 5 %), porque cuenta como visto;
+- en directos sin duracion.
+
+Bajo el reproductor aparece la lista: tocar un elemento lo reproduce en su
+modo, y cada uno tiene boton para quitarlo. "Borrar todo" pide confirmacion.
+
+Comprobado en el telefono con Big Buck Bunny:
+1. Se detuvo en 44.6 s y se cerro la app por completo.
+2. La lista mostro `continuar en 0:44 / 10:34`, y al tocarla reanudo en
+   `time-pos=44.64s`.
+3. Con la pantalla apagada el archivo siguio avanzando (96.9 s).
+
 ### Video integrado y controles
 
 `src/video.rs` usa la API de render de libmpv sobre el contexto **OpenGL ES 3**
