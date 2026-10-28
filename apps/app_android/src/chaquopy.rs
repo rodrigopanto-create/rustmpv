@@ -1,5 +1,6 @@
 use jni::objects::{JClass, JObject, JString, JValue};
 use jni::{Env, JavaVM, jni_sig, jni_str};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -200,30 +201,68 @@ fn call_string(
     .map_err(|error: BridgeError| error.0)
 }
 
-/// Busca una version nueva de yt-dlp sin bloquear el worker; se aplica al reiniciar.
-fn spawn_update_check(vm: &JavaVM, class: &jni::refs::Global<JClass<'static>>) {
-    let class = match vm.attach_current_thread(|env| env.new_global_ref(class)) {
-        Ok(class) => class,
-        Err(error) => {
-            log::error!("Referencia para actualizar yt-dlp: {error}");
-            return;
-        }
-    };
-    let vm = vm.clone();
-    let spawned = std::thread::Builder::new()
-        .name("yt-dlp-update".to_owned())
-        .spawn(
-            move || match call_string(&vm, &class, jni_str!("checkYtDlpUpdate")) {
-                Ok(message) if !message.is_empty() => notify(message),
-                Ok(_) => {}
-                Err(error) => log::error!("Buscar actualizacion de yt-dlp: {error}"),
-            },
-        );
-    if let Err(error) = spawned {
-        log::error!("Hilo de actualizacion de yt-dlp: {error}");
-    }
+static UPDATER: OnceLock<(JavaVM, jni::refs::Global<JClass<'static>>)> = OnceLock::new();
+static CHECKING: AtomicBool = AtomicBool::new(false);
+
+/// Busqueda manual: ignora el limite de 24 h y siempre deja un aviso con el resultado.
+pub fn check_update_now() -> Result<(), String> {
+    spawn_update_check(true)
 }
 
+pub fn update_check_available() -> bool {
+    UPDATER.get().is_some() && !CHECKING.load(Ordering::Acquire)
+}
+
+/// Busca una version nueva de yt-dlp sin bloquear el worker; se aplica al reiniciar.
+fn spawn_update_check(force: bool) -> Result<(), String> {
+    let (vm, class) = UPDATER
+        .get()
+        .ok_or_else(|| "yt-dlp aun se esta preparando".to_owned())?;
+    if CHECKING.swap(true, Ordering::AcqRel) {
+        return Err("Ya se esta buscando una actualizacion".to_owned());
+    }
+    let spawned = std::thread::Builder::new()
+        .name("yt-dlp-update".to_owned())
+        .spawn(move || {
+            let result = vm
+                .attach_current_thread(|env| {
+                    let result = (|| {
+                        let value = env
+                            .call_static_method(
+                                class,
+                                jni_str!("checkYtDlpUpdate"),
+                                jni_sig!("(Z)Ljava/lang/String;"),
+                                &[JValue::Bool(force)],
+                            )?
+                            .l()?;
+                        if value.is_null() {
+                            return Err(jni::errors::Error::NullPtr("checkYtDlpUpdate"));
+                        }
+                        let value = unsafe { JString::from_raw(env, value.into_raw()) };
+                        Ok(value.to_string())
+                    })();
+                    result.map_err(|error| java_error(env, error))
+                })
+                .map_err(|error: BridgeError| error.0);
+            match result {
+                Ok(message) if !message.is_empty() => notify(message),
+                Ok(_) => {}
+                Err(error) => {
+                    log::error!("Buscar actualizacion de yt-dlp: {error}");
+                    if force {
+                        notify(format!(
+                            "No se pudo buscar actualizacion de yt-dlp: {error}"
+                        ));
+                    }
+                }
+            }
+            CHECKING.store(false, Ordering::Release);
+        });
+    spawned.map(|_| ()).map_err(|error| {
+        CHECKING.store(false, Ordering::Release);
+        format!("Hilo de actualizacion de yt-dlp: {error}")
+    })
+}
 fn spawn_worker() -> Result<Worker, String> {
     let android = ndk_context::android_context();
     let vm = unsafe { JavaVM::from_raw(android.vm() as *mut _) };
@@ -289,7 +328,15 @@ fn spawn_worker() -> Result<Worker, String> {
                     Ok(_) => {}
                     Err(error) => log::error!("Verificar actualizacion de yt-dlp: {error}"),
                 }
-                spawn_update_check(&vm, &class);
+                match vm.attach_current_thread(|env| env.new_global_ref(&class)) {
+                    Ok(updater_class) => {
+                        let _ = UPDATER.set((vm.clone(), updater_class));
+                        if let Err(error) = spawn_update_check(false) {
+                            log::error!("{error}");
+                        }
+                    }
+                    Err(error) => log::error!("Referencia para actualizar yt-dlp: {error}"),
+                }
             }
             for job in queue {
                 if job

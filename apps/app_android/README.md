@@ -101,7 +101,6 @@ exacta de `yt-dlp-ejs` que fija. Antes de usarlos comprueba:
 - las rutas y el tamano descomprimido.
 
 Solo extrae `yt_dlp/` y `yt_dlp_ejs/` en `files/yt-dlp-update/v/<version>`.
-Despues el estado avisa que se aplicara al reiniciar.
 
 En el siguiente arranque, `activate()` pone esa version al frente de `sys.path`
 antes de importar yt-dlp. Nunca cambia modulos en caliente. La version queda en
@@ -111,8 +110,10 @@ rechaza y vuelve la incluida si:
 - no importa;
 - pasan dos arranques sin poder verificarla.
 
-Reinstalar el APK descarta lo descargado. El estado muestra
-`yt-dlp X (actualizado)`. Comprobado en el telefono con 2026.10.21 empaquetado:
+Reinstalar el APK descarta lo descargado. La interfaz incluye el boton
+`Actualizar yt-dlp` junto al selector de modo: fuerza una comprobacion
+inmediata (ignora las 24 h) y se desactiva mientras busca.
+Comprobado en el telefono con 2026.10.21 empaquetado:
 1. Descargo 2026.10.26 en 2.3 s.
 2. Al reiniciar la verifico con una extraccion de 6.8 s; el player se volvio a
    preparar en 41 s en segundo plano.
@@ -139,7 +140,9 @@ exigir tanto `libqjs.so` y su licencia como los dos scripts locales EJS.
 `MainActivity` pasa la ruta instalada al runner. Antes de extraer, Python
 ejecuta una comprobacion JavaScript con timeout de 10 segundos (una vez
 por ruta/proceso); ausencia, timeout, fallo de ejecucion o salida invalida
-se convierten en errores visibles. yt-dlp recibe explicitamente
+se convierten en errores visibles. Para dejar la GUI limpia, el texto de estado
+de depuracion y la linea de salida de audio se quitaron de pantalla y quedan en
+logs. yt-dlp recibe explicitamente
 `js_runtimes={"quickjs": {"path": runtime_path}}`, sin buscar Deno o Node.
 
 Gradle fija el par compatible **yt-dlp 2026.10.26 / yt-dlp-ejs 0.8.0**.

@@ -73,8 +73,7 @@ version is newer, it downloads the `py3-none-any` wheels for yt-dlp and for the
 exact `yt-dlp-ejs` version that release pins. Wheels come only from
 `files.pythonhosted.org`, with size and SHA-256 checked against PyPI. Only the
 `yt_dlp/` and `yt_dlp_ejs/` packages are extracted, with path and size limits,
-into `files/yt-dlp-update/v/<version>`. The UI then shows
-`yt-dlp X descargado; se aplicara al reiniciar la app`.
+into `files/yt-dlp-update/v/<version>`.
 
 On the next start, `MainActivity.warmUpYtDlp` calls `activate()` before
 anything imports `yt_dlp`, so the download goes first on `sys.path`. Modules
@@ -84,8 +83,10 @@ fails while online, or the version fails to import, the version is rejected
 and never downloaded again. The bundled version is used from the next start.
 Failures while offline only postpone verification, for at most two unverified
 starts. Installing a new APK changes `lastUpdateTime`, which discards any
-downloaded version. The status bar shows `yt-dlp X (actualizado)` while an
-update is active. YouTube's player cache is per yt-dlp version, so the first
+downloaded version. The UI now has an `Actualizar yt-dlp` button beside
+`Video MP4` / `Audio directo`; it triggers a forced check immediately (ignores
+the 24-hour limit) and disables itself while checking. YouTube's player cache is
+per yt-dlp version, so the first
 start on a new version prepares the player again (~41 s, in the background).
 
 Verified on the device by bundling 2026.10.21:
@@ -106,9 +107,9 @@ APK assets. The Windows build requires `ANDROID_NDK_HOME` and `tar`;
 run the full script after Gradle `clean` to prepare QuickJS and its license.
 
 Playback status comes from nonblocking libmpv events, not successful command
-submission. The UI shows loading, playback, pause, buffering, EOF and errors,
-plus position/duration and the active audio output. Native HTTPS uses certifi's
-CA bundle from the same Chaquopy runtime with TLS verification enabled.
+submission. The GUI no longer prints the debug-style status line or active
+audio output line; those details remain in logs. Native HTTPS uses certifi's CA
+bundle from the same Chaquopy runtime with TLS verification enabled.
 OpenSL ES audio was verified on the connected API 31 device with a progressing
 playback clock and an active Android AudioFlinger track; the user also confirmed
 audible output in the audio-only build.

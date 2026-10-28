@@ -283,15 +283,15 @@ def check(root: str, apk_stamp: str, running_version: str, cafile: str,
     latest = _latest_version(context)
     if version_tuple(latest) <= (version_tuple(running_version) or ()):
         _log(f"Al dia ({running_version}; ultima {latest})")
-        return ""
+        return f"yt-dlp {running_version} esta al dia" if force else ""
     state = _read_state(root)
     if state.get("apk") == apk_stamp and state.get("version") == latest \
             and os.path.isdir(_path(root, "v", latest)):
         _log(f"{latest} ya descargado; pendiente de reinicio")
-        return ""
+        return f"yt-dlp {latest} ya descargado; reinicia la app para usarlo" if force else ""
     if _read_text(root, "rejected") == latest:
         _log(f"{latest} omitido: fallo su verificacion")
-        return ""
+        return f"yt-dlp {latest} se descarto porque fallo su verificacion" if force else ""
     started = time.monotonic()
     wheel = _download_wheel("yt-dlp", latest, context)
     ejs_version = _pinned_ejs(wheel, latest)

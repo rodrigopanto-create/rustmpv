@@ -189,9 +189,9 @@ public final class MainActivity extends NativeActivity {
                 "verify_update", ytDlpUpdateDir(), quickJsPath(), ytDlpCacheDir()).toString();
     }
 
-    /** Downloads a newer yt-dlp for the next start; "" when nothing changed. */
-    public static String checkYtDlpUpdate() {
-        return ytDlpRunner().callAttr("check_update", ytDlpUpdateDir(), apkStamp()).toString();
+    /** Downloads a newer yt-dlp for the next start; "" when nothing changed unless forced. */
+    public static String checkYtDlpUpdate(boolean force) {
+        return ytDlpRunner().callAttr("check_update", ytDlpUpdateDir(), apkStamp(), force).toString();
     }
 
     private static void rejectYtDlpUpdate() {

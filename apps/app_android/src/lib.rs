@@ -349,18 +349,30 @@ impl eframe::App for AndroidAppState {
                     ui.horizontal(|ui| {
                         ui.selectable_value(&mut self.mode, PlaybackMode::Video, "Video MP4");
                         ui.selectable_value(&mut self.mode, PlaybackMode::Audio, "Audio directo");
+                        #[cfg(feature = "chaquopy")]
+                        {
+                            let enabled = chaquopy::update_check_available();
+                            let button =
+                                ui.add_enabled(enabled, egui::Button::new("Actualizar yt-dlp"));
+                            if button.clicked() {
+                                if let Err(error) = chaquopy::check_update_now() {
+                                    log::error!("Buscar actualizacion de yt-dlp: {error}");
+                                    self.status = format!(
+                                        "No se pudo buscar actualizacion de yt-dlp: {error}"
+                                    );
+                                }
+                            } else if !enabled {
+                                button.on_hover_text("Comprobando actualizaciones...");
+                            }
+                        }
                     });
                 });
-                ui.label(format!("Estado: {}", self.status));
                 if self.stream_receiver.is_some()
                     || (playback.active
                         && playback.error.is_none()
                         && (!playback.loaded || !playback.started || playback.buffering))
                 {
                     controls::loading_bar(ui);
-                }
-                if let Some(output) = &playback.audio_output {
-                    ui.label(format!("Salida de audio: {output}"));
                 }
                 if let Some(error) = &self.video_error {
                     ui.colored_label(egui::Color32::LIGHT_RED, format!("Video: {error}"));

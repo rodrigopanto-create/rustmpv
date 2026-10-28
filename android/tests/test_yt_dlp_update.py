@@ -145,7 +145,7 @@ class UpdaterTests(unittest.TestCase):
         os.makedirs(self.root, exist_ok=True)
         with open(os.path.join(self.root, "rejected"), "w", encoding="utf-8") as file:
             file.write(VERSION)
-        self.assertEqual(self.check(force=True), "")
+        self.assertIn("se descarto", self.check(force=True))
         self.assertEqual([method for method, _ in self.requests], ["HEAD", "HEAD"])
 
     def test_check_rejects_hash_mismatch(self):
@@ -239,7 +239,7 @@ class UpdaterTests(unittest.TestCase):
         self.assertTrue(self.updater.reject_active(self.root))
         with open(os.path.join(self.root, "rejected"), encoding="utf-8") as file:
             self.assertEqual(file.read(), VERSION)
-        self.assertEqual(self.check(force=True), "")
+        self.assertIn("se descarto", self.check(force=True))
 
     def download_again(self):
         state = self.state()

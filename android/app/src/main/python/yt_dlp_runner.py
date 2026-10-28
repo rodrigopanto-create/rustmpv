@@ -201,11 +201,11 @@ def verify_update(update_root: str, runtime_path: str, cache_dir: str | None = N
     return f"yt-dlp {version} verificado"
 
 
-def check_update(update_root: str, apk_stamp: str) -> str:
+def check_update(update_root: str, apk_stamp: str, force: bool = False) -> str:
     import certifi
     import yt_dlp_update
     from yt_dlp.version import __version__
-    return yt_dlp_update.check(update_root, apk_stamp, __version__, certifi.where())
+    return yt_dlp_update.check(update_root, apk_stamp, __version__, certifi.where(), force=force)
 
 
 def _clean_text(value: object) -> str:
