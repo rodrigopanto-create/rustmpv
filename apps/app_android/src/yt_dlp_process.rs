@@ -1,4 +1,4 @@
-use crate::stream_url::validate_stream_url;
+use crate::stream_url::validate_stream_urls;
 use std::io::{self, Read};
 #[cfg(target_os = "android")]
 use std::path::Path;
@@ -98,7 +98,8 @@ pub fn run(mut command: Command, timeout: Duration) -> Result<String, String> {
     }
     let output =
         String::from_utf8(stdout).map_err(|error| format!("stdout no es UTF-8: {error}"))?;
-    validate_stream_url(&output)
+    validate_stream_urls(&output)?;
+    Ok(output)
 }
 
 #[cfg(target_os = "android")]
@@ -108,7 +109,7 @@ pub fn resolve(
     python_home: &Path,
     input: &str,
     audio_only: bool,
-) -> Result<String, String> {
+) -> Result<Vec<String>, String> {
     let mut command = Command::new(executable);
     if let Some(directory) = executable.parent() {
         command.env("LD_LIBRARY_PATH", directory);
@@ -123,7 +124,7 @@ pub fn resolve(
     }
     command.args([
         "--ignore-config",
-        "--no-playlist",
+        "--ignore-errors",
         "--no-progress",
         "--socket-timeout",
         "10",
@@ -131,19 +132,21 @@ pub fn resolve(
         "1",
         "--extractor-retries",
         "1",
+        "--playlist-end",
+        "100",
         "-g",
         "-f",
-        if audio_only { "bestaudio" } else { "best" },
+        if audio_only { "bestaudio/best" } else { "best" },
         "--",
         input,
     ]);
     log::info!("Iniciando yt-dlp en subproceso");
     let result = run(command, RESOLVE_TIMEOUT);
     match &result {
-        Ok(_) => log::info!("yt-dlp resolvio una URL HTTP(S)"),
+        Ok(urls) => log::info!("yt-dlp resolvio {} URL(s) HTTP(S)", urls.lines().count()),
         Err(error) => log::error!("Error del subproceso yt-dlp: {error}"),
     }
-    result
+    result.and_then(|output| validate_stream_urls(&output))
 }
 
 #[cfg(test)]

@@ -42,7 +42,7 @@ eliminaban el script del APK en la validacion real.
 
 Flujo: arranque -> hilo persistente `yt-dlp-worker` -> `warmUpYtDlp`;
 Play -> cola `mpsc` -> JNI -> `MainActivity.extractStreamUrl` ->
-`yt_dlp_runner.extract_stream_url` -> URL HTTP(S) -> canal por peticion -> libmpv.
+`yt_dlp_runner.extract_media` -> streams validados -> canal por peticion -> libmpv.
 El puente carga `MainActivity` con `Context.getClassLoader().loadClass(...)`
 y conserva una referencia global a esa clase. `ndk-context` proporciona
 `Application`, no la Activity; su clase no contiene `extractMedia`.
@@ -69,6 +69,31 @@ un trabajo; se procesan en serie y responden por un canal propio, de modo
 que la GUI no se bloquea y Detener sigue descartando el resultado pendiente.
 Los errores normales de extraccion conservan la instancia; los inesperados
 la descartan y se recrea en el siguiente Play.
+
+Las URLs de playlist de YouTube se resuelven como maximo a 100 streams.
+La interfaz carga el primero y encola los siguientes en libmpv para que
+continuen automaticamente. Los elementos privados o no disponibles se
+omiten; la interfaz informa el error si no queda ninguno reproducible.
+Las listas mayores se limitan a sus primeros 100 elementos; los enlaces
+individuales y las URLs directas mantienen el comportamiento anterior.
+
+Ademas de YouTube, yt-dlp resuelve enlaces de X/Twitter (`x.com`,
+`twitter.com`), Instagram (`instagram.com`, `instagr.am`) y Facebook
+(`facebook.com`, `fb.watch`, `fb.com`), incluidos sus subdominios. Cualquier
+otro host HTTP(S) se entrega directo a libmpv. Como estos sitios no siempre
+ofrecen audio separado ni altura conocida, los formatos son
+`bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best` (Audio) y
+`best[ext=mp4][height<=720][protocol^=http]/best[ext=mp4][height<=720]/best[height<=720]/best`
+(Video): se prefiere un MP4 progresivo con audio y video en un solo stream.
+Las publicaciones con varios videos (carruseles de Instagram, tweets con
+varios clips) se encolan igual que una lista. Solo funcionan publicaciones
+publicas: el contenido que exige sesion iniciada falla con el error de yt-dlp,
+porque la app no envia cookies. Cuando la extraccion falla, la UI muestra en
+rojo el motivo real de yt-dlp (por ejemplo, "La publicacion no es publica o
+requiere iniciar sesion...") mientras la URL no cambie; la linea de estado
+de depuracion sigue oculta. Verificado en Redmi Note 8 Pro (Android 11): un
+reel publico de Instagram se reproduce con imagen visible; tweets restringidos y reels que
+exigen sesion muestran el error en rojo.
 
 Medicion en el dispositivo: de ~33 s por extraccion, ~29 s eran QuickJS
 preprocesando el player de YouTube (~2.5 MB) en cada llamada, porque
@@ -426,6 +451,15 @@ AudioFlinger confirmo la pista activa de la app a 44100 Hz y al terminar
 la GUI mostro **Reproduccion finalizada**. No reaparecio el error de JVM
 del backend AudioTrack.
 
+En un Redmi Note 8 Pro se probo `https://www.youtube.com/playlist?list=PLBCF2DAC6FFB574DE`:
+yt-dlp resolvio 10 elementos reproducibles, omitio 3 videos privados/no disponibles
+y libmpv avanzo automaticamente al siguiente elemento al terminar el primero.
+Las listas se limitan a 100 elementos.
+
+En un OPPO CPH2127 (Android 12) se reprodujeron con imagen y avance
+automatico: un tweet de `x.com` (MP4 progresivo de `video.twimg.com`), un
+video de Facebook (`facebook.com/cnn/videos/...`, formato `hd`) y un
+carrusel de Instagram con 3 videos encolados (`Lista encolada: 3 elementos`).
 La advertencia original de runtime JavaScript ausente motivo la inclusion
 de QuickJS-ng y EJS. Esto no elimina otros requisitos posibles de YouTube
 (autenticacion, restricciones regionales o tokens del proveedor).
@@ -452,9 +486,11 @@ Backend opcional, independiente de Chaquopy y de la C-API `native-python`:
 cargo apk build --manifest-path apps/app_android/Cargo.toml --lib --no-default-features --features yt-dlp-subprocess
 ```
 
-No combinar esta feature con `chaquopy` ni `native-python`. La opcion Audio utiliza `-f bestaudio`; Video utiliza `-f best`,
-un unico formato con audio y video, no `bestvideo+bestaudio`. `best` puede no
-estar disponible para algunos videos: ese error se comunica sin fallback oculto.
+No combinar esta feature con `chaquopy` ni `native-python`. La opcion Audio utiliza `-f bestaudio/best`
+(X/Twitter no ofrece audio separado); Video utiliza `-f best`,
+un unico formato con audio y video, no `bestvideo+bestaudio`. yt-dlp resuelve
+hasta 100 elementos por lista y omite los que no estan disponibles. `best` puede
+no estar disponible para algunos videos: ese error se comunica sin fallback oculto.
 
 ### Restriccion importante de Android
 

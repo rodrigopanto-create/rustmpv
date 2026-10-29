@@ -149,6 +149,18 @@ Aspect ratio and Android system-bar margins are preserved. OpenGL ES 3 is
 required for video. Decoding is currently software-only; hardware decoding
 remains future work.
 Audio loads use file-local `vid=no`; Video loads use `vid=auto`.
+YouTube playlist URLs resolve up to 100 direct streams; the first starts
+immediately and the remaining entries are queued in libmpv for sequential
+playback. Unavailable entries are skipped; larger lists are capped at 100.
+X/Twitter (`x.com`, `twitter.com`), Instagram (`instagram.com`, `instagr.am`)
+and Facebook (`facebook.com`, `fb.watch`, `fb.com`) links are also resolved by
+yt-dlp; other HTTP(S) hosts go straight to libmpv. Format selection falls back
+to progressive MP4 with audio when no separate audio or known height exists,
+and multi-video posts are queued like playlists. Only public posts work; no
+cookies are sent. Resolve failures show yt-dlp's real reason in red while the
+URL is unchanged (the debug status line stays hidden). Checked on the Redmi
+Note 8 Pro (Android 11): a public Instagram reel rendered; restricted tweets
+and login-only reels showed the red error.
 Pause/resume, seeking and loading use asynchronous mpv commands to avoid
 blocking the render thread. Audio continues on lock/background in both Audio
 and Video modes. Lifecycle callbacks disable only the video track while hidden,

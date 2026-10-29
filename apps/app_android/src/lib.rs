@@ -77,6 +77,20 @@ unsafe extern "C" {
     fn mpv_terminate_destroy(context: *mut std::ffi::c_void);
 }
 
+#[cfg(target_os = "android")]
+fn append_stream(context: usize, stream_url: &str, mode: PlaybackMode) -> Result<(), String> {
+    let stream_url = stream_url::validate_stream_url(stream_url)?;
+    let options = if mode == PlaybackMode::Video {
+        "vid=auto"
+    } else {
+        "vid=no"
+    };
+    send_mpv_command(
+        context,
+        &["loadfile", &stream_url, "append-play", "-1", options],
+    )
+}
+
 /// Estado de la interfaz Android.
 #[cfg(target_os = "android")]
 struct AndroidAppState {
@@ -84,6 +98,8 @@ struct AndroidAppState {
     url: String,
     mode: PlaybackMode,
     status: String,
+    /// Fallo de yt-dlp visible solo mientras la URL siga siendo la misma.
+    resolve_error: Option<(String, String)>,
     playback: std::sync::Arc<std::sync::Mutex<playback::Playback>>,
     mpv_context: usize,
     stream_receiver: Option<Receiver<Result<stream_url::MediaInfo, String>>>,
@@ -152,6 +168,7 @@ impl AndroidAppState {
             url: String::new(),
             mode: PlaybackMode::Audio,
             status,
+            resolve_error: None,
             playback,
             mpv_context,
             stream_receiver: None,
@@ -424,6 +441,15 @@ impl eframe::App for AndroidAppState {
                 if let Some(error) = &self.video_error {
                     ui.colored_label(egui::Color32::LIGHT_RED, format!("Video: {error}"));
                 }
+                if let Some((_, error)) = self
+                    .resolve_error
+                    .as_ref()
+                    .filter(|(input, _)| input == self.url.trim())
+                {
+                    ui.colored_label(egui::Color32::LIGHT_RED, error);
+                } else if let Some(error) = &playback.error {
+                    ui.colored_label(egui::Color32::LIGHT_RED, format!("Error: {error}"));
+                }
                 if self.playing_mode == PlaybackMode::Video {
                     let width = ui.available_width();
                     let height = (width * 9.0 / 16.0).min(ui.available_height()).max(1.0);
@@ -663,6 +689,7 @@ impl AndroidAppState {
     }
 
     fn load_resolved_stream(&mut self, media: stream_url::MediaInfo) {
+        let queued = media.playlist.clone();
         let mut playback = self.playback.lock().expect("playback lock");
         playback.poll(self.mpv_context);
         // Records the previous item's last position before switching.
@@ -673,15 +700,25 @@ impl AndroidAppState {
             &media.title,
             &media.artist,
         );
-        match load_stream(self.mpv_context, &media.url, self.mode, resume) {
+        let loaded = load_stream(self.mpv_context, &media.url, self.mode, resume).and_then(|()| {
+            for url in &queued {
+                append_stream(self.mpv_context, url, self.mode)?;
+            }
+            Ok(())
+        });
+        match loaded {
             Ok(()) => {
                 playback.loading();
                 self.playing_mode = self.mode;
                 self.seek_position = None;
                 self.status = match resume {
                     Some(position) => format!("Reanudando en {}", controls::clock(position)),
-                    None => playback.status(),
+                    None if queued.is_empty() => playback.status(),
+                    None => format!("Lista en cola: {} elementos", queued.len() + 1),
                 };
+                if !queued.is_empty() {
+                    log::info!("Lista encolada: {} elementos", queued.len() + 1);
+                }
                 drop(playback);
                 lifecycle::set_video(self.mode == PlaybackMode::Video);
                 self.service_request =
@@ -696,13 +733,14 @@ impl AndroidAppState {
         }
     }
 
-    /// Resuelve YouTube en segundo plano o acepta una URL directa.
+    /// Resuelve YouTube, X/Twitter, Instagram o Facebook en segundo plano o acepta una URL directa.
     fn resolve_and_play(&mut self) {
         if self.url.trim().is_empty() {
             self.status = "Introduce una URL".to_owned();
             return;
         }
         let input = self.url.trim().to_owned();
+        self.resolve_error = None;
         if self.mode == PlaybackMode::Video {
             if let Some(error) = &self.video_error {
                 self.status = format!("Video no disponible: {error}");
@@ -724,7 +762,7 @@ impl AndroidAppState {
             }
         }
         self.discard_resolution = false;
-        if is_http_url(&input) && !is_youtube_url(&input) {
+        if is_http_url(&input) && !needs_resolver(&input) {
             self.stream_receiver = None;
             self.last_resolved_at = Some(std::time::Instant::now());
             self.load_resolved_stream(stream_url::MediaInfo::direct(input));
@@ -798,7 +836,13 @@ impl AndroidAppState {
         self.status = "Resolviendo con yt-dlp (subproceso)...".to_owned();
         std::thread::spawn(move || {
             let result = (|| {
-                let (_, url) = canonical_youtube_url(&input)?;
+                let url = if media_site(&input) == Some(MediaSite::YouTube)
+                    && !is_youtube_playlist_url(&input)
+                {
+                    canonical_youtube_url(&input)?.1
+                } else {
+                    input.clone()
+                };
                 let files_dir = android_app
                     .internal_data_path()
                     .ok_or_else(|| "Android no proporciono filesDir".to_owned())?;
@@ -828,7 +872,7 @@ impl AndroidAppState {
                 log::error!("Resolver yt-dlp: {error}");
             }
             if sender
-                .send(result.map(stream_url::MediaInfo::direct))
+                .send(result.and_then(stream_url::MediaInfo::from_urls))
                 .is_err()
             {
                 log::info!("La interfaz ya no espera el resultado de yt-dlp");
@@ -909,7 +953,7 @@ impl AndroidAppState {
                 .last_resolved_at
                 .is_some_and(|time| time.elapsed() < prefetch::TTL);
         let eligible =
-            is_youtube_url(input) && !already_loaded && (audio_only || self.video_error.is_none());
+            needs_resolver(input) && !already_loaded && (audio_only || self.video_error.is_none());
         let key = eligible.then(|| prefetch::Key {
             input: input.to_owned(),
             audio_only,
@@ -962,6 +1006,7 @@ impl AndroidAppState {
                 log::error!("No se pudo resolver el enlace: {error}");
                 self.stream_receiver = None;
                 self.status = format!("No se pudo resolver el enlace: {error}");
+                self.resolve_error = Some((self.url.trim().to_owned(), user_facing_error(&error)));
             }
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => {
@@ -1268,20 +1313,76 @@ fn is_http_url(input: &str) -> bool {
     input.starts_with("http://") || input.starts_with("https://")
 }
 
-/// Limita el resolver remoto a dominios YouTube compatibles.
+/// Quita los prefijos del puente Java/Python para mostrar solo la causa.
+#[cfg(any(test, target_os = "android"))]
+fn user_facing_error(error: &str) -> String {
+    let reason = error
+        .rsplit_once("RuntimeError: ")
+        .map_or(error, |(_, reason)| reason);
+    format!("No se pudo reproducir: {}", reason.trim())
+}
+
+/// Sitios cuyas paginas deben pasar por yt-dlp antes de llegar a libmpv.
+#[cfg(any(test, target_os = "android"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MediaSite {
+    YouTube,
+    Twitter,
+    Instagram,
+    Facebook,
+}
+
+#[cfg(any(test, target_os = "android"))]
+fn media_site(input: &str) -> Option<MediaSite> {
+    let url = url::Url::parse(input).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    let host = url.host_str()?.to_ascii_lowercase();
+    let host = host.trim_end_matches('.');
+    let on = |domain: &str| {
+        host == domain
+            || host
+                .strip_suffix(domain)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    };
+    if ["youtu.be", "youtube.com", "youtube-nocookie.com"]
+        .into_iter()
+        .any(on)
+    {
+        Some(MediaSite::YouTube)
+    } else if ["twitter.com", "x.com"].into_iter().any(on) {
+        Some(MediaSite::Twitter)
+    } else if ["instagram.com", "instagr.am"].into_iter().any(on) {
+        Some(MediaSite::Instagram)
+    } else if ["facebook.com", "fb.watch", "fb.com"].into_iter().any(on) {
+        Some(MediaSite::Facebook)
+    } else {
+        None
+    }
+}
+
+/// Limita yt-dlp a los sitios compatibles; el resto se entrega directo a libmpv.
 #[cfg(target_os = "android")]
-fn is_youtube_url(input: &str) -> bool {
-    reqwest::Url::parse(input)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
-        .map(|host| {
-            host == "youtu.be"
-                || host == "youtube.com"
-                || host.ends_with(".youtube.com")
-                || host == "youtube-nocookie.com"
-                || host.ends_with(".youtube-nocookie.com")
-        })
-        .unwrap_or(false)
+fn needs_resolver(input: &str) -> bool {
+    media_site(input).is_some()
+}
+
+#[cfg(any(test, all(target_os = "android", feature = "yt-dlp-subprocess")))]
+fn is_youtube_playlist_url(input: &str) -> bool {
+    let Ok(url) = url::Url::parse(input) else {
+        return false;
+    };
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let supported_host = host == "youtu.be"
+        || host == "youtube.com"
+        || host.ends_with(".youtube.com")
+        || host == "youtube-nocookie.com"
+        || host.ends_with(".youtube-nocookie.com");
+    supported_host
+        && url
+            .query_pairs()
+            .any(|(key, value)| key == "list" && !value.is_empty())
 }
 
 /// Inicializa la instancia nativa de libmpv enlazada en el APK.
@@ -1546,8 +1647,25 @@ pub fn desktop_placeholder() -> &'static str {
 
 #[cfg(test)]
 mod layout_tests {
-    use super::system_bar_margins;
+    use super::{
+        is_youtube_playlist_url, media_site, system_bar_margins, user_facing_error, MediaSite,
+    };
     use eframe::egui;
+
+    #[test]
+    fn shows_only_the_python_error_reason() {
+        assert_eq!(
+            user_facing_error(
+                "Chaquopy/yt-dlp: com.chaquo.python.PyException: RuntimeError: \
+                 La publicacion no es publica"
+            ),
+            "No se pudo reproducir: La publicacion no es publica"
+        );
+        assert_eq!(
+            user_facing_error("sin red"),
+            "No se pudo reproducir: sin red"
+        );
+    }
 
     #[test]
     fn reserves_system_bars_in_logical_points() {
@@ -1587,5 +1705,56 @@ mod layout_tests {
             system_bar_margins([-10, -20, 800, 1700], [720, 1600], 2.0),
             egui::Margin::default()
         );
+    }
+
+    #[test]
+    fn detects_only_youtube_playlist_urls() {
+        assert!(is_youtube_playlist_url(
+            "https://www.youtube.com/playlist?list=PL123"
+        ));
+        assert!(is_youtube_playlist_url(
+            "https://youtu.be/abcdefghijk?list=PL123"
+        ));
+        assert!(!is_youtube_playlist_url(
+            "https://youtube.com/watch?v=abcdefghijk"
+        ));
+        assert!(!is_youtube_playlist_url(
+            "https://youtube.com.evil.example/playlist?list=PL123"
+        ));
+        assert!(!is_youtube_playlist_url(
+            "https://example.com/playlist?list=PL123"
+        ));
+    }
+
+    #[test]
+    fn routes_social_video_sites_to_yt_dlp() {
+        for (url, site) in [
+            ("https://youtu.be/abcdefghijk", MediaSite::YouTube),
+            ("https://m.youtube.com/watch?v=abcdefghijk", MediaSite::YouTube),
+            ("https://x.com/user/status/1", MediaSite::Twitter),
+            ("https://mobile.twitter.com/user/status/1", MediaSite::Twitter),
+            ("https://www.instagram.com/reel/abc/", MediaSite::Instagram),
+            ("https://instagr.am/p/abc/", MediaSite::Instagram),
+            ("https://www.facebook.com/user/videos/1/", MediaSite::Facebook),
+            ("https://m.facebook.com/watch/?v=1", MediaSite::Facebook),
+            ("https://fb.watch/abc/", MediaSite::Facebook),
+            ("HTTPS://WWW.X.COM./user/status/1", MediaSite::Twitter),
+        ] {
+            assert_eq!(media_site(url), Some(site), "{url}");
+        }
+    }
+
+    #[test]
+    fn leaves_other_urls_for_direct_playback() {
+        for url in [
+            "https://example.com/video.mp4",
+            "https://notx.com/user/status/1",
+            "https://facebook.com.evil.example/videos/1",
+            "https://evilinstagram.com/reel/abc/",
+            "ftp://x.com/video.mp4",
+            "x.com/user/status/1",
+        ] {
+            assert_eq!(media_site(url), None, "{url}");
+        }
     }
 }

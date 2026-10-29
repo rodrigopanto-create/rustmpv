@@ -41,8 +41,9 @@ class RunnerTests(unittest.TestCase):
 
     def test_audio_and_video_formats_and_network_limits(self):
         for audio_only, expected in [
-            (True, "bestaudio[ext=m4a]/bestaudio[ext=webm]"),
-            (False, "best[ext=mp4][height<=720]"),
+            (True, "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best"),
+            (False, "best[ext=mp4][height<=720][protocol^=http]/best[ext=mp4][height<=720]"
+                    "/best[height<=720]/best"),
         ]:
             with self.subTest(audio_only=audio_only):
                 self.downloader.extract_info.return_value = {"url": "https://cdn.example/video"}
@@ -53,7 +54,9 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(options["socket_timeout"], 10)
                 self.assertEqual(options["retries"], 1)
                 self.assertEqual(options["extractor_retries"], 1)
-                self.assertTrue(options["noplaylist"])
+                self.assertFalse(options["noplaylist"])
+                self.assertEqual(options["playlistend"], 100)
+                self.assertTrue(options["ignoreerrors"])
                 self.assertTrue(options["skip_download"])
                 self.assertEqual(options["js_runtimes"], {"quickjs": {"path": self.runtime_path}})
                 self.assertEqual(options["remote_components"], set())
@@ -67,6 +70,136 @@ class RunnerTests(unittest.TestCase):
             "requested_downloads": [{"url": "https://cdn.example/audio"}]}
         self.assertEqual(self.resolve("https://youtube.com/watch?v=12345678901", True),
                          "https://cdn.example/audio")
+
+    def test_playlist_returns_bounded_stream_queue(self):
+        self.downloader.extract_info.return_value = {
+            "_type": "playlist",
+            "entries": [
+                {"url": f"https://cdn.example/{index}", "title": f"Track {index}"}
+                for index in range(3)
+            ],
+        }
+        media = self.media("https://youtube.com/playlist?list=PL123", False)
+        self.assertEqual(media["url"], "https://cdn.example/0")
+        self.assertEqual(
+            media["playlist"],
+            ["https://cdn.example/1", "https://cdn.example/2"],
+        )
+        self.assertEqual(self.downloader.extract_info.call_count, 1)
+
+    def test_playlist_skips_unavailable_entries(self):
+        self.downloader.extract_info.return_value = {
+            "_type": "playlist",
+            "entries": [
+                None,
+                {"url": "https://cdn.example/available", "title": "Available"},
+            ],
+        }
+        media = self.media("https://youtube.com/playlist?list=PL123", False)
+        self.assertEqual(media["url"], "https://cdn.example/available")
+        self.assertEqual(media["playlist"], [])
+
+    def test_playlist_skips_flat_entries_rejected_by_extractor(self):
+        self.downloader.extract_info.side_effect = [
+            {
+                "_type": "playlist",
+                "entries": [
+                    {"_type": "url", "id": "private", "ie_key": "Youtube"},
+                    {"_type": "url", "id": "public", "ie_key": "Youtube"},
+                ],
+            },
+            self.download_error("private video"),
+            {"url": "https://cdn.example/public", "title": "Public"},
+        ]
+        media = self.media("https://youtube.com/playlist?list=PL123", True)
+        self.assertEqual(media["url"], "https://cdn.example/public")
+        self.assertEqual(media["playlist"], [])
+
+    def test_playlist_resolves_flat_entries_and_caps_at_100(self):
+        self.downloader.extract_info.side_effect = [
+            {
+                "_type": "playlist",
+                "entries": [
+                    {"_type": "url", "id": f"video{index}", "ie_key": "Youtube"}
+                    for index in range(105)
+                ],
+            },
+            *[
+                {"url": f"https://cdn.example/{index}", "title": f"Track {index}"}
+                for index in range(100)
+            ],
+        ]
+        media = self.media("https://youtube.com/playlist?list=PL123", True)
+        self.assertEqual(media["url"], "https://cdn.example/0")
+        self.assertEqual(len(media["playlist"]), 99)
+        self.assertEqual(media["playlist"][-1], "https://cdn.example/99")
+        self.assertEqual(self.downloader.extract_info.call_count, 101)
+        self.assertEqual(
+            self.downloader.extract_info.call_args_list[1].args[0],
+            "https://www.youtube.com/watch?v=video0",
+        )
+
+    def test_social_multi_video_post_resolves_flat_entry_urls(self):
+        self.downloader.extract_info.side_effect = [
+            {
+                "_type": "playlist",
+                "entries": [
+                    {"_type": "url", "id": "1", "ie_key": "Twitter",
+                     "url": "https://x.com/user/status/1/video/1"},
+                    {"_type": "url", "id": "2", "ie_key": "Twitter"},
+                    {"url": "https://video.twimg.com/3.mp4", "title": "Inline"},
+                ],
+            },
+            {"url": "https://video.twimg.com/1.mp4", "title": "First"},
+        ]
+        media = self.media("https://x.com/user/status/1", False)
+        self.assertEqual(media["url"], "https://video.twimg.com/1.mp4")
+        self.assertEqual(media["playlist"], ["https://video.twimg.com/3.mp4"])
+        self.assertEqual(
+            self.downloader.extract_info.call_args_list[1].args[0],
+            "https://x.com/user/status/1/video/1",
+        )
+        self.assertEqual(self.downloader.extract_info.call_count, 2)
+
+    def fail_with(self, message):
+        def extract(url, download):
+            self.factory.call_args.args[0]["logger"].error(message)
+            return None
+        self.downloader.extract_info.side_effect = extract
+
+    def test_hidden_post_reports_login_requirement(self):
+        for message in [
+            "ERROR: [twitter] 1: No video could be found in this tweet",
+            "ERROR: [Instagram] abc: Instagram sent an empty media response. "
+            "Check if this post is accessible in your browser without being logged-in.",
+        ]:
+            with self.subTest(message=message):
+                self.fail_with(message)
+                with self.assertRaises(RuntimeError) as raised:
+                    self.media("https://x.com/user/status/1", False)
+                text = str(raised.exception)
+                self.assertIn("requiere iniciar sesion", text)
+                self.assertNotIn("Check if", text)
+
+    def test_other_extraction_errors_keep_their_reason(self):
+        self.fail_with("ERROR: [facebook] 1: Unable to download webpage: HTTP Error 500")
+        with self.assertRaises(RuntimeError) as raised:
+            self.media("https://www.facebook.com/user/videos/1/", False)
+        self.assertEqual(
+            str(raised.exception),
+            "yt-dlp no pudo extraer el medio: [facebook] 1: "
+            "Unable to download webpage: HTTP Error 500",
+        )
+
+    def test_previous_error_is_not_reported_for_a_later_failure(self):
+        self.fail_with("ERROR: [twitter] 1: No video could be found in this tweet")
+        with self.assertRaises(RuntimeError):
+            self.media("https://x.com/user/status/1", False)
+        self.downloader.extract_info.side_effect = None
+        self.downloader.extract_info.return_value = None
+        with self.assertRaises(RuntimeError) as raised:
+            self.media("https://x.com/user/status/2", False)
+        self.assertEqual(str(raised.exception), "yt-dlp no devolvio informacion de medios valida")
 
     def test_rejects_missing_invalid_or_multiple_streams(self):
         for info in [None, {}, {"_type": "playlist"}, {"url": "file:///tmp/x"},
@@ -124,8 +257,7 @@ class RunnerTests(unittest.TestCase):
         self.runner.warm_up(self.runtime_path, "/cache/yt-dlp")
         self.run.assert_called_once()
         formats = [call.args[0]["format"] for call in self.factory.call_args_list]
-        self.assertEqual(formats, ["bestaudio[ext=m4a]/bestaudio[ext=webm]",
-                                   "best[ext=mp4][height<=720]"])
+        self.assertEqual(formats, [self.runner._AUDIO_FORMAT, self.runner._VIDEO_FORMAT])
         self.assertEqual({call.args[0]["cachedir"] for call in self.factory.call_args_list},
                          {"/cache/yt-dlp"})
         self.downloader.get_info_extractor.assert_called_with("Youtube")
@@ -240,8 +372,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result, "preparado")
         self.downloader.extract_info.assert_called_once_with(
             self.runner._PLAYER_WARMUP_URL, download=False)
-        self.assertEqual(self.factory.call_args.args[0]["format"],
-                         "bestaudio[ext=m4a]/bestaudio[ext=webm]")
+        self.assertEqual(self.factory.call_args.args[0]["format"], self.runner._AUDIO_FORMAT)
 
     def test_warm_player_without_player_url_or_cache_does_nothing(self):
         result, check = self.warm_player(None, [])

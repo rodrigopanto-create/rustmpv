@@ -1,4 +1,5 @@
 const TEXT_LIMIT: usize = 200;
+pub const PLAYLIST_LIMIT: usize = 100;
 #[cfg(any(feature = "chaquopy", test))]
 const THUMBNAIL_LIMIT: usize = 3;
 
@@ -9,6 +10,7 @@ pub struct MediaInfo {
     pub title: String,
     pub artist: String,
     pub thumbnails: Vec<String>,
+    pub playlist: Vec<String>,
 }
 
 #[cfg(any(feature = "chaquopy", test))]
@@ -21,9 +23,29 @@ struct RawMedia {
     artist: String,
     #[serde(default)]
     thumbnails: Vec<String>,
+    #[serde(default)]
+    playlist: Vec<String>,
 }
 
 impl MediaInfo {
+    #[cfg(any(feature = "yt-dlp-subprocess", test))]
+    pub fn from_urls(urls: Vec<String>) -> Result<Self, String> {
+        if urls.is_empty() || urls.len() > PLAYLIST_LIMIT {
+            return Err(format!(
+                "La lista debe contener de 1 a {} elementos",
+                PLAYLIST_LIMIT
+            ));
+        }
+        let mut urls = urls.into_iter();
+        let first = validate_stream_url(&urls.next().expect("non-empty URL list"))?;
+        let playlist = urls
+            .map(|url| validate_stream_url(&url))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut media = Self::direct(first);
+        media.playlist = playlist;
+        Ok(media)
+    }
+
     /// URL directa sin extractor: el titulo sale del nombre del archivo.
     pub fn direct(url: String) -> Self {
         let parsed = url::Url::parse(&url).ok();
@@ -45,6 +67,7 @@ impl MediaInfo {
             title: clean_text(&file),
             artist: clean_text(&host),
             thumbnails: Vec::new(),
+            playlist: Vec::new(),
         }
     }
 
@@ -53,6 +76,17 @@ impl MediaInfo {
     pub fn from_json(json: &str) -> Result<Self, String> {
         let raw: RawMedia = serde_json::from_str(json)
             .map_err(|error| format!("Respuesta de yt-dlp invalida: {error}"))?;
+        if raw.playlist.len() >= PLAYLIST_LIMIT {
+            return Err(format!(
+                "La lista supera el limite de {} elementos",
+                PLAYLIST_LIMIT
+            ));
+        }
+        let playlist = raw
+            .playlist
+            .into_iter()
+            .map(|url| validate_stream_url(&url))
+            .collect::<Result<Vec<_>, _>>()?;
         let thumbnails = raw
             .thumbnails
             .iter()
@@ -65,6 +99,7 @@ impl MediaInfo {
             title: clean_text(&raw.title),
             artist: clean_text(&raw.artist),
             thumbnails,
+            playlist,
         })
     }
 }
@@ -126,6 +161,21 @@ pub fn validate_stream_url(output: &str) -> Result<String, String> {
     Ok(value.to_owned())
 }
 
+#[cfg(any(feature = "yt-dlp-subprocess", test))]
+pub fn validate_stream_urls(output: &str) -> Result<Vec<String>, String> {
+    let lines: Vec<_> = output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    if lines.is_empty() || lines.len() > PLAYLIST_LIMIT {
+        return Err(format!(
+            "yt-dlp debe devolver de 1 a {} URLs de stream",
+            PLAYLIST_LIMIT
+        ));
+    }
+    lines.into_iter().map(validate_stream_url).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,12 +201,33 @@ mod tests {
     }
 
     #[test]
+    fn validates_bounded_playlist_urls() {
+        let urls = (0..PLAYLIST_LIMIT)
+            .map(|index| format!("https://cdn.example/{index}"))
+            .collect::<Vec<_>>();
+        let parsed = validate_stream_urls(&urls.join("\n")).unwrap();
+        assert_eq!(parsed.len(), PLAYLIST_LIMIT);
+        assert!(validate_stream_urls("").is_err());
+        assert!(
+            validate_stream_urls(
+                &(0..=PLAYLIST_LIMIT)
+                    .map(|index| format!("https://cdn.example/{index}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+            .is_err()
+        );
+        assert!(validate_stream_urls("https://cdn.example/ok\ninvalid").is_err());
+    }
+
+    #[test]
     fn media_json_is_validated_and_sanitized() {
         let media = MediaInfo::from_json(
             r#"{"url":"https://cdn.example/a","title":" Big\nBuck\u0000 Bunny ",
                 "artist":"Blender","thumbnails":["http://plain/x.jpg","file:///x",
                 "https://i.ytimg.com/a.jpg","https://i.ytimg.com/b.jpg",
-                "https://i.ytimg.com/c.jpg","https://i.ytimg.com/d.jpg"]}"#,
+                "https://i.ytimg.com/c.jpg","https://i.ytimg.com/d.jpg"],
+                "playlist":["https://cdn.example/b","https://cdn.example/c"]}"#,
         )
         .unwrap();
         assert_eq!(media.url, "https://cdn.example/a");
@@ -171,6 +242,10 @@ mod tests {
             ]
         );
         assert_eq!(
+            media.playlist,
+            ["https://cdn.example/b", "https://cdn.example/c"]
+        );
+        assert_eq!(
             MediaInfo::from_json(&format!(
                 r#"{{"url":"https://a.b","title":"{}"}}"#,
                 "x".repeat(300)
@@ -183,6 +258,12 @@ mod tests {
         for invalid in ["", "{}", r#"{"url":"file:///x"}"#, r#"{"url":5}"#] {
             assert!(MediaInfo::from_json(invalid).is_err(), "{invalid:?}");
         }
+        assert!(
+            MediaInfo::from_json(
+                r#"{"url":"https://cdn.example/a","playlist":["file:///private"]}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -191,5 +272,25 @@ mod tests {
         assert_eq!(media.title, "My Song+1.mp3");
         assert_eq!(media.artist, "media.example");
         assert!(media.thumbnails.is_empty());
+        assert!(media.playlist.is_empty());
+    }
+
+    #[test]
+    fn subprocess_urls_become_a_validated_playlist() {
+        let media = MediaInfo::from_urls(vec![
+            "https://cdn.example/first".to_owned(),
+            "https://cdn.example/second".to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(media.url, "https://cdn.example/first");
+        assert_eq!(media.playlist, ["https://cdn.example/second"]);
+        assert!(MediaInfo::from_urls(Vec::new()).is_err());
+        assert!(
+            MediaInfo::from_urls(vec![
+                "https://cdn.example/first".to_owned(),
+                "file:///private".to_owned(),
+            ])
+            .is_err()
+        );
     }
 }

@@ -1,6 +1,7 @@
 """Chaquopy entry point for the original yt-dlp Python package."""
 
 from functools import cache
+from itertools import islice
 import json
 import os
 import subprocess
@@ -48,8 +49,14 @@ def _check_js_runtime(runtime_path: str) -> None:
     print("[JavaScript] QuickJS-ng verificado en nativeLibraryDir", flush=True)
 
 
-_AUDIO_FORMAT = "bestaudio[ext=m4a]/bestaudio[ext=webm]"
-_VIDEO_FORMAT = "best[ext=mp4][height<=720]"
+_AUDIO_FORMAT = "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best"
+# X/Twitter, Instagram and Facebook may lack an audio-only format or a known
+# height; progressive HTTP(S) MP4 keeps audio and video in one libmpv stream.
+_VIDEO_FORMAT = (
+    "best[ext=mp4][height<=720][protocol^=http]/best[ext=mp4][height<=720]"
+    "/best[height<=720]/best"
+)
+_PLAYLIST_LIMIT = 100
 _PLAYER_CACHE_SECTION = "challenge-solver"
 # yt-dlp stores key "player:<url>" percent-encoded with "%" replaced by ",".
 _PLAYER_CACHE_PREFIX = "player,3A"
@@ -59,12 +66,65 @@ _PLAYER_CACHE_LIMIT = 2
 # YouTube extractor keeps player code and solved n/sig challenges in memory.
 _downloaders: dict[tuple[bool, str, str | None], YoutubeDL] = {}
 
+# yt-dlp reports these when a post exists but is hidden from anonymous visitors.
+_LOGIN_REQUIRED_HINTS = (
+    "no video could be found",
+    "empty media response",
+    "login",
+    "log in",
+    "cookies",
+    "private",
+    "age-restricted",
+    "age restricted",
+    "sensitive",
+)
+
+
+class _ErrorLog:
+    """yt-dlp logger; ignoreerrors hides failures as None, so keep the last one."""
+
+    def __init__(self) -> None:
+        self.last: str | None = None
+
+    def debug(self, message: str) -> None:
+        pass
+
+    def info(self, message: str) -> None:
+        pass
+
+    def warning(self, message: str) -> None:
+        print(f"[yt-dlp] {message}", flush=True)
+
+    def error(self, message: str) -> None:
+        self.last = message
+        print(f"[yt-dlp] {message}", flush=True)
+
+
+_errors = _ErrorLog()
+
+
+def _failure_message(error: str | None) -> str:
+    if not error:
+        return "yt-dlp no devolvio informacion de medios valida"
+    text = _clean_text(error.removeprefix("ERROR:"))
+    # Keep the extractor's first sentence; the rest is generic yt-dlp advice.
+    reason = text.split(". ")[0].rstrip(".")
+    if any(hint in reason.lower() for hint in _LOGIN_REQUIRED_HINTS):
+        return (
+            "La publicacion no es publica o requiere iniciar sesion "
+            f"(privada, sensible o con restriccion de edad): {reason}"
+        )
+    return f"yt-dlp no pudo extraer el medio: {reason}"
+
 
 def _options(audio_only: bool, runtime_path: str, cache_dir: str | None) -> dict:
     return {
-        "noplaylist": True,
+        "logger": _errors,
+        "noplaylist": False,
+        "playlistend": _PLAYLIST_LIMIT,
         "quiet": True,
         "skip_download": True,
+        "ignoreerrors": True,
         "socket_timeout": 10,
         "retries": 1,
         "extractor_retries": 1,
@@ -249,6 +309,7 @@ def extract_media(
     _check_js_runtime(runtime_path)
     started = time.monotonic()
     downloader = _downloader(audio_only, runtime_path, cache_dir)
+    _errors.last = None
     try:
         info = downloader.extract_info(url, download=False)
     except DownloadError:
@@ -266,15 +327,81 @@ def extract_media(
         f"{time.monotonic() - started:.2f} s",
         flush=True,
     )
-    if not isinstance(info, dict) or info.get("_type") in ("playlist", "multi_video"):
-        raise RuntimeError("yt-dlp no devolvio un unico medio reproducible")
+    if not isinstance(info, dict):
+        raise RuntimeError(_failure_message(_errors.last))
+    if info.get("_type") in ("playlist", "multi_video"):
+        entries = info.get("entries")
+        if entries is None:
+            raise RuntimeError("yt-dlp devolvio una lista sin elementos")
+        selected = list(islice(entries, _PLAYLIST_LIMIT + 1))
+        if not selected:
+            raise RuntimeError("La lista no contiene elementos reproducibles")
+        if len(selected) > _PLAYLIST_LIMIT:
+            print(f"[yt-dlp] Lista limitada a {_PLAYLIST_LIMIT} elementos", flush=True)
+            selected = selected[:_PLAYLIST_LIMIT]
+        media = []
+        skipped = 0
+        for index, entry in enumerate(selected, 1):
+            if entry is None:
+                skipped += 1
+                continue
+            if not isinstance(entry, dict):
+                raise RuntimeError(f"El elemento {index} de la lista no es valido")
+            try:
+                if entry.get("_type") in ("url", "url_transparent"):
+                    entry_url = next(
+                        (
+                            candidate
+                            for candidate in (entry.get("webpage_url"), entry.get("url"))
+                            if isinstance(candidate, str)
+                            and candidate.startswith(("http://", "https://"))
+                        ),
+                        None,
+                    )
+                    if entry_url is None:
+                        video_id = entry.get("id")
+                        if (
+                            entry.get("ie_key") not in (None, "Youtube")
+                            or not isinstance(video_id, str)
+                            or not video_id
+                        ):
+                            raise RuntimeError(
+                                f"No se pudo resolver el elemento {index} de la lista"
+                            )
+                        entry_url = f"https://www.youtube.com/watch?v={video_id}"
+                    entry = downloader.extract_info(entry_url, download=False)
+            except (DownloadError, RuntimeError) as error:
+                skipped += 1
+                print(f"[yt-dlp] Se omite elemento {index}: {error}", flush=True)
+                continue
+            try:
+                media.append(_media_payload(entry))
+            except RuntimeError as error:
+                skipped += 1
+                print(f"[yt-dlp] Se omite elemento {index}: {error}", flush=True)
+        if not media:
+            raise RuntimeError("La lista no contiene elementos reproducibles")
+        result = media[0]
+        result["playlist"] = [item["url"] for item in media[1:]]
+        print(
+            f"[yt-dlp] Lista resuelta: {len(media)} elementos; "
+            f"{skipped} omitidos",
+            flush=True,
+        )
+        return json.dumps(result)
+    return json.dumps(_media_payload(info))
+
+
+def _media_payload(info: object) -> dict:
+    if not isinstance(info, dict) or info.get("_type") in ("playlist", "multi_video", "url", "url_transparent"):
+        raise RuntimeError("yt-dlp no devolvio un medio individual reproducible")
     requested = info.get("requested_downloads") or []
     if len(requested) > 1:
         raise RuntimeError("yt-dlp devolvio varios streams; se requiere un formato directo")
     stream_url = requested[0].get("url") if requested else info.get("url")
-    return json.dumps({
+    return {
         "url": _validate_stream_url(stream_url),
         "title": _clean_text(info.get("title")),
         "artist": _clean_text(info.get("channel") or info.get("uploader")),
         "thumbnails": _thumbnail_candidates(info),
-    })
+    }
