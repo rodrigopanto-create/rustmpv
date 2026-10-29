@@ -139,9 +139,13 @@ OpenSL ES audio was verified on the connected API 31 device with a progressing
 playback clock and an active Android AudioFlinger track; the user also confirmed
 audible output in the audio-only build.
 
-Video now uses libmpv's OpenGL render API inside an egui/Glow callback.
-An offscreen RGBA8 framebuffer is copied into the in-app video rectangle,
-preserving aspect ratio and the Android system-bar margins. OpenGL ES 3 is
+Video uses libmpv's OpenGL render API in a separate EGL context with a 1 x 1
+Pbuffer and textures shared with eframe/Glow. An egui callback composites the
+offscreen RGBA8 texture into the in-app video rectangle using a shader.
+Producer writes and consumer reads are synchronized with `glFinish` across
+context switches. This isolates mpv's GL state from egui and fixes the black
+video observed on the Redmi Note 8 Pro (Mali-G76).
+Aspect ratio and Android system-bar margins are preserved. OpenGL ES 3 is
 required for video. Decoding is currently software-only; hardware decoding
 remains future work.
 Audio loads use file-local `vid=no`; Video loads use `vid=auto`.

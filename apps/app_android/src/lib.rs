@@ -26,6 +26,8 @@ use std::sync::mpsc::{self, Receiver};
 mod chaquopy;
 #[cfg(any(target_os = "android", test))]
 mod controls;
+#[cfg(target_os = "android")]
+mod egl;
 #[cfg(any(target_os = "android", test))]
 mod history;
 #[cfg(any(target_os = "android", test))]
@@ -106,6 +108,8 @@ struct AndroidAppState {
     history: Vec<history::Entry>,
     history_revision: u64,
     confirm_clear: bool,
+    last_interaction: std::time::Instant,
+    show_controls: bool,
 }
 
 #[cfg(target_os = "android")]
@@ -171,6 +175,8 @@ impl AndroidAppState {
             history: Vec::new(),
             history_revision: 0,
             confirm_clear: false,
+            last_interaction: std::time::Instant::now(),
+            show_controls: true,
         }
     }
 }
@@ -299,6 +305,39 @@ impl eframe::App for AndroidAppState {
             self.keep_awake_request = Some(screen::keep_awake(&self.android_app, keep_awake));
         }
         let mut frame = egui::Frame::central_panel(&context.style());
+        let now = std::time::Instant::now();
+        let interacting = context.input(|input| {
+            input.pointer.delta() != egui::Vec2::ZERO
+                || input.pointer.any_down()
+                || input.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::PointerButton { .. }
+                            | egui::Event::Touch { .. }
+                            | egui::Event::Key { .. }
+                            | egui::Event::Text(_)
+                            | egui::Event::MouseWheel { .. }
+                            | egui::Event::WindowFocused(true)
+                    )
+                })
+        });
+        controls::update_visibility(
+            &mut self.last_interaction,
+            &mut self.show_controls,
+            now,
+            playback.is_playing(),
+            interacting,
+        );
+        if self.show_controls && playback.is_playing() {
+            context.request_repaint_after(
+                (controls::HIDE_AFTER + std::time::Duration::from_millis(1))
+                    .saturating_sub(now.duration_since(self.last_interaction)),
+            );
+        }
+        if screen::fullscreen() {
+            frame.inner_margin = egui::Margin::default();
+            frame.fill = egui::Color32::BLACK;
+        }
         if let Some(window) = self.android_app.native_window() {
             let content = self.android_app.content_rect();
             let margins = system_bar_margins(
@@ -314,15 +353,23 @@ impl eframe::App for AndroidAppState {
         egui::CentralPanel::default()
             .frame(frame)
             .show(context, |ui| {
+                if self.show_controls {
+                    egui::TopBottomPanel::bottom("controls_panel")
+                        .resizable(false)
+                        .exact_height(controls::CONTROL_SIZE + 12.0)
+                        .frame(egui::Frame::none().inner_margin(egui::Margin::symmetric(0.0, 6.0)))
+                        .show_inside(ui, |ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            ui.horizontal_centered(|ui| {
+                                self.draw_transport(ui);
+                                self.draw_seek(ui);
+                            });
+                        });
+                }
                 if screen::fullscreen() {
-                    let size = ui.available_size();
-                    let (rect, _) = ui.allocate_exact_size(
-                        egui::vec2(size.x, (size.y - 72.0).max(1.0)),
-                        egui::Sense::hover(),
-                    );
+                    let (rect, _) =
+                        ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
                     self.draw_video(ui, rect);
-                    self.draw_transport(ui);
-                    self.draw_seek(ui);
                     return;
                 }
                 ui.heading("VisualRustMPV Android");
@@ -377,14 +424,6 @@ impl eframe::App for AndroidAppState {
                 if let Some(error) = &self.video_error {
                     ui.colored_label(egui::Color32::LIGHT_RED, format!("Video: {error}"));
                 }
-                egui::TopBottomPanel::bottom("portrait_media_controls")
-                    .resizable(false)
-                    .exact_height(40.0 + ui.spacing().item_spacing.y + ui.spacing().interact_size.y)
-                    .frame(egui::Frame::none())
-                    .show_inside(ui, |ui| {
-                        self.draw_transport(ui);
-                        self.draw_seek(ui);
-                    });
                 if self.playing_mode == PlaybackMode::Video {
                     let width = ui.available_width();
                     let height = (width * 9.0 / 16.0).min(ui.available_height()).max(1.0);
@@ -416,99 +455,91 @@ impl AndroidAppState {
     fn draw_transport(&mut self, ui: &mut egui::Ui) {
         use controls::{Icon, button};
         let playback = self.playback.lock().expect("playback lock").clone();
-        ui.horizontal(|ui| {
-            let pending = self.stream_receiver.is_some();
-            if button(ui, Icon::Play, "Reproducir / Reanudar", !pending).clicked() {
-                let same_media = self
-                    .last_media
-                    .as_ref()
-                    .is_some_and(|(input, mode, _)| input == self.url.trim() && *mode == self.mode);
-                if same_media && playback.active && playback.loaded {
-                    self.run_player_command(&["set", "pause", "no"]);
-                } else {
-                    self.resolve_and_play();
-                }
+        let pending = self.stream_receiver.is_some();
+        if button(ui, Icon::Play, "Reproducir / Reanudar", !pending).clicked() {
+            let same_media = self
+                .last_media
+                .as_ref()
+                .is_some_and(|(input, mode, _)| input == self.url.trim() && *mode == self.mode);
+            if same_media && playback.active && playback.loaded {
+                self.run_player_command(&["set", "pause", "no"]);
+            } else {
+                self.resolve_and_play();
             }
-            if button(
-                ui,
-                Icon::Pause,
-                "Pausar",
-                playback.active && playback.loaded && !playback.paused,
-            )
-            .clicked()
-            {
-                self.run_player_command(&["set", "pause", "yes"]);
+        }
+        if button(
+            ui,
+            Icon::Pause,
+            "Pausar",
+            playback.active && playback.loaded && !playback.paused,
+        )
+        .clicked()
+        {
+            self.run_player_command(&["set", "pause", "yes"]);
+        }
+        if button(ui, Icon::Stop, "Detener", playback.active || pending).clicked() {
+            self.discard_resolution = pending;
+            if self.run_player_command(&["stop"]) {
+                let mut playback = self.playback.lock().expect("playback lock");
+                playback.stop();
+                self.seek_position = None;
+                self.status = playback.status();
             }
-            if button(ui, Icon::Stop, "Detener", playback.active || pending).clicked() {
-                self.discard_resolution = pending;
-                if self.run_player_command(&["stop"]) {
-                    let mut playback = self.playback.lock().expect("playback lock");
-                    playback.stop();
-                    self.seek_position = None;
-                    self.status = playback.status();
-                }
-            }
-            let fullscreen = screen::fullscreen();
-            if button(
-                ui,
-                if fullscreen {
-                    Icon::Restore
-                } else {
-                    Icon::Fullscreen
-                },
-                if fullscreen {
-                    "Salir de pantalla completa"
-                } else {
-                    "Pantalla completa horizontal"
-                },
-                self.screen_request.is_none()
-                    && (fullscreen
-                        || (self.playing_mode == PlaybackMode::Video
-                            && playback.loaded
-                            && self.video_error.is_none())),
-            )
-            .clicked()
-            {
-                self.screen_request = Some(screen::request(&self.android_app, !fullscreen));
-            }
-        });
+        }
+        let fullscreen = screen::fullscreen();
+        if button(
+            ui,
+            if fullscreen {
+                Icon::Restore
+            } else {
+                Icon::Fullscreen
+            },
+            if fullscreen {
+                "Salir de pantalla completa"
+            } else {
+                "Pantalla completa horizontal"
+            },
+            self.screen_request.is_none()
+                && (fullscreen
+                    || (self.playing_mode == PlaybackMode::Video
+                        && playback.loaded
+                        && self.video_error.is_none())),
+        )
+        .clicked()
+        {
+            self.screen_request = Some(screen::request(&self.android_app, !fullscreen));
+        }
     }
 
     fn draw_seek(&mut self, ui: &mut egui::Ui) {
         let playback = self.playback.lock().expect("playback lock").clone();
-        ui.horizontal(|ui| {
-            let duration = playback
-                .duration
-                .filter(|value| value.is_finite() && *value > 0.0);
-            ui.label(format!(
-                "{} / {}",
-                controls::clock(playback.position.unwrap_or(0.0)),
-                duration
-                    .map(controls::clock)
-                    .unwrap_or_else(|| "--:--".to_owned())
-            ));
-            ui.add_enabled_ui(
-                playback.active && playback.loaded && duration.is_some(),
-                |ui| {
-                    let mut position = self
-                        .seek_position
-                        .unwrap_or(playback.position.unwrap_or(0.0));
-                    let slider = ui
-                        .add(
-                            egui::Slider::new(&mut position, 0.0..=duration.unwrap_or(1.0))
-                                .show_value(false),
-                        )
-                        .on_hover_text("Buscar posicion");
-                    if slider.dragged() {
-                        self.seek_position = Some(position);
-                    }
-                    if slider.drag_stopped() || (slider.changed() && !slider.dragged()) {
-                        self.seek_position = None;
-                        self.run_player_command(&["seek", &position.to_string(), "absolute"]);
-                    }
-                },
-            );
-        });
+        let duration = playback
+            .duration
+            .filter(|value| value.is_finite() && *value > 0.0);
+        let timer = format!(
+            "{} / {}",
+            controls::clock(playback.position.unwrap_or(0.0)),
+            duration
+                .map(controls::clock)
+                .unwrap_or_else(|| "--:--".to_owned())
+        );
+        let mut position = self
+            .seek_position
+            .unwrap_or(playback.position.unwrap_or(0.0));
+        let slider = controls::seek(
+            ui,
+            &mut position,
+            duration,
+            &timer,
+            playback.active && playback.loaded && duration.is_some(),
+        );
+        if slider.dragged() {
+            self.seek_position = Some(position);
+        }
+        if slider.drag_stopped() || (slider.changed() && !slider.dragged()) {
+            self.seek_position = None;
+            self.run_player_command(&["seek", &position.to_string(), "absolute"]);
+        }
     }
 
     fn draw_history(&mut self, ui: &mut egui::Ui) {

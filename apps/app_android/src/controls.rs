@@ -1,7 +1,26 @@
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 use eframe::egui;
+use std::time::{Duration, Instant};
 
-#[cfg(target_os = "android")]
+pub const HIDE_AFTER: Duration = Duration::from_secs(3);
+pub const CONTROL_SIZE: f32 = 40.0;
+
+pub fn update_visibility(
+    last_interaction: &mut Instant,
+    show_controls: &mut bool,
+    now: Instant,
+    playing: bool,
+    interacting: bool,
+) {
+    if interacting || !playing {
+        *last_interaction = now;
+        *show_controls = true;
+    } else if now.duration_since(*last_interaction) > HIDE_AFTER {
+        *show_controls = false;
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
 #[derive(Clone, Copy)]
 pub enum Icon {
     Play,
@@ -11,11 +30,11 @@ pub enum Icon {
     Restore,
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 pub fn button(ui: &mut egui::Ui, icon: Icon, label: &str, enabled: bool) -> egui::Response {
     let response = ui.add_enabled(
         enabled,
-        egui::Button::new("").min_size(egui::vec2(44.0, 40.0)),
+        egui::Button::new("").min_size(egui::Vec2::splat(CONTROL_SIZE)),
     );
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
     let center = response.rect.center();
@@ -75,6 +94,38 @@ pub fn button(ui: &mut egui::Ui, icon: Icon, label: &str, enabled: bool) -> egui
     response.on_hover_text(label)
 }
 
+#[cfg(any(target_os = "android", test))]
+pub fn seek(
+    ui: &mut egui::Ui,
+    position: &mut f64,
+    duration: Option<f64>,
+    timer: &str,
+    enabled: bool,
+) -> egui::Response {
+    let timer = ui.painter().layout_no_wrap(
+        timer.to_owned(),
+        egui::FontId::monospace(12.0),
+        ui.visuals().text_color(),
+    );
+    let width = (ui.available_width() - timer.size().x - ui.spacing().item_spacing.x).max(0.0);
+    // In egui 0.29 add_sized alone does not expand the slider's track.
+    let response = ui
+        .scope(|ui| {
+            ui.spacing_mut().slider_width = width;
+            ui.add_enabled_ui(enabled, |ui| {
+                ui.add_sized(
+                    [width, 20.0],
+                    egui::Slider::new(position, 0.0..=duration.unwrap_or(1.0)).show_value(false),
+                )
+            })
+            .inner
+        })
+        .inner
+        .on_hover_text("Buscar posicion");
+    ui.add(egui::Label::new(timer).selectable(false));
+    response
+}
+
 #[cfg(target_os = "android")]
 pub fn loading_bar(ui: &mut egui::Ui) {
     let (rect, response) =
@@ -123,7 +174,132 @@ pub fn clock(seconds: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::clock;
+    use super::*;
+
+    #[test]
+    fn hides_only_after_three_seconds_of_playback_inactivity() {
+        let start = Instant::now();
+        let mut last = start;
+        let mut visible = true;
+        update_visibility(&mut last, &mut visible, start + HIDE_AFTER, true, false);
+        assert!(visible);
+        update_visibility(
+            &mut last,
+            &mut visible,
+            start + HIDE_AFTER + Duration::from_millis(1),
+            true,
+            false,
+        );
+        assert!(!visible);
+        for playing in [true, false] {
+            update_visibility(
+                &mut last,
+                &mut visible,
+                start + Duration::from_secs(10),
+                playing,
+                playing,
+            );
+            assert!(visible);
+            assert_eq!(last, start + Duration::from_secs(10));
+        }
+    }
+
+    #[test]
+    fn held_pointer_keeps_controls_visible_and_inactivity_restarts_on_resume() {
+        let start = Instant::now();
+        let mut last = start;
+        let mut visible = true;
+        for seconds in 1..=10 {
+            update_visibility(
+                &mut last,
+                &mut visible,
+                start + Duration::from_secs(seconds),
+                true,
+                true,
+            );
+            assert!(visible);
+        }
+        let paused_at = start + Duration::from_secs(30);
+        update_visibility(&mut last, &mut visible, paused_at, false, false);
+        update_visibility(
+            &mut last,
+            &mut visible,
+            paused_at + Duration::from_secs(2),
+            true,
+            false,
+        );
+        assert!(visible);
+    }
+
+    #[test]
+    fn controls_share_a_single_row_and_seek_expands_without_overflow() {
+        for width in [320.0, 360.0, 800.0] {
+            for (duration, timer) in [
+                (Some(120.0), "0:10 / 2:00"),
+                (Some(7200.0), "1:01:01 / 2:00:00"),
+                (None, "0:00 / --:--"),
+            ] {
+                let context = egui::Context::default();
+                let mut slider_width = 0.0;
+                let _ = context.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 480.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |context| {
+                        egui::TopBottomPanel::bottom("controls_panel")
+                            .exact_height(CONTROL_SIZE + 12.0)
+                            .frame(
+                                egui::Frame::none().inner_margin(egui::Margin::symmetric(0.0, 6.0)),
+                            )
+                            .show(context, |ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                let right = ui.max_rect().right();
+                                let row = ui.horizontal_centered(|ui| {
+                                    let mut buttons = Vec::new();
+                                    for icon in [
+                                        Icon::Play,
+                                        Icon::Pause,
+                                        Icon::Stop,
+                                        if width > 400.0 {
+                                            Icon::Restore
+                                        } else {
+                                            Icon::Fullscreen
+                                        },
+                                    ] {
+                                        buttons.push(button(ui, icon, "Control", true).rect);
+                                    }
+                                    let mut position = 10.0;
+                                    let slider = seek(
+                                        ui,
+                                        &mut position,
+                                        duration,
+                                        timer,
+                                        duration.is_some(),
+                                    );
+                                    slider_width = slider.rect.width();
+                                    for rect in buttons {
+                                        assert_eq!(rect.size(), egui::Vec2::splat(CONTROL_SIZE));
+                                        assert!(
+                                            (rect.center().y - slider.rect.center().y).abs() < 1.0
+                                        );
+                                    }
+                                    assert!(ui.available_width() < 1.0);
+                                });
+                                assert!(row.response.rect.right() <= right + 1.0);
+                            });
+                    },
+                );
+                assert!(slider_width > 0.0);
+                if width == 800.0 {
+                    assert!(slider_width > 400.0);
+                }
+            }
+        }
+    }
 
     #[test]
     fn formats_media_times() {

@@ -220,9 +220,14 @@ Comprobado en el telefono con Big Buck Bunny:
 
 ### Video integrado y controles
 
-`src/video.rs` usa la API de render de libmpv sobre el contexto **OpenGL ES 3**
-de eframe/Glow. mpv dibuja en un framebuffer RGBA8 propio, y el callback
-egui lo copia al rectangulo de video con clipping. No se crea otra ventana
+`src/video.rs` usa la API de render de libmpv en un contexto **OpenGL ES 3**
+EGL separado, con un Pbuffer de 1 x 1 y texturas compartidas con eframe/Glow.
+mpv dibuja en un framebuffer RGBA8 propio y el callback egui compone su textura
+con un shader, respetando el rectangulo de video y su clipping. Se sincronizan
+las lecturas y escrituras GPU con `glFinish` antes de cambiar de contexto.
+Esto evita que el estado GL de mpv interfiera con egui, como ocurria con
+video negro y errores GL en el Redmi Note 8 Pro (Mali-G76).
+No se crea otra ventana
 ni una SurfaceView superpuesta: los controles y las barras del sistema
 mantienen sus coordenadas. mpv conserva la proporcion de imagen y agrega
 bandas negras cuando el medio no coincide con el area 16:9.
@@ -236,7 +241,7 @@ El video usa decodificacion por software (`hwdec=no`,
 Se desactiva el OSD de mpv, sustituido por los controles egui.
 
 Los controles vectoriales Play, Pausa y Stop usan iconos estandar y botones
-tactiles de 44 x 40 puntos. Play reanuda el medio actual; Stop lo detiene
+tactiles de 40 x 40 puntos. Play reanuda el medio actual; Stop lo detiene
 y un nuevo Play comienza desde cero. La URL directa se conserva solo en
 memoria durante cinco minutos para no repetir la extraccion al reiniciar.
 Un error de reproduccion obliga a resolver de nuevo. Stop durante una
@@ -247,6 +252,14 @@ En vertical, los botones de reproduccion y pantalla completa, el reloj y
 el deslizador quedan anclados al borde inferior del area util, por encima
 de la barra de navegacion Android. La URL y el selector Audio/Video siguen
 arriba, y el video utiliza el espacio entre ambos sin solapar los controles.
+En ambas orientaciones forman una sola fila centrada verticalmente:
+Play, Pausa, Stop, pantalla completa, deslizador expansible y reloj.
+El deslizador reserva el ancho real del reloj, incluso al mostrar horas.
+Tras mas de 3 segundos sin actividad durante la reproduccion, la fila
+se oculta; mover el puntero, tocar o usar el teclado la vuelve a mostrar.
+Un puntero inmovil no reinicia el plazo. Mientras se mantiene pulsado o
+se arrastra el deslizador no se oculta. Pausa, Stop, fin o error mantienen
+los controles visibles.
 Debajo del mensaje de estado aparece una barra indeterminada animada durante
 la resolucion del enlace, la preparacion del stream y el buffering. No muestra
 porcentajes porque esas operaciones no informan un progreso total medible.
@@ -264,8 +277,9 @@ observadas (pausa y salida de audio): mpv no vuelve a notificarlas si no
 cambiaron. Una prueba de regresion cubre este caso.
 
 El boton de pantalla completa oculta las barras del sistema y solicita
-orientacion horizontal por sensor (ambos lados). Los controles permanecen
-visibles debajo del video. El boton de restaurar vuelve a vertical y
+orientacion horizontal por sensor (ambos lados). Al ocultarse los controles,
+el video ocupa toda el area util sin reservar espacio para la fila inferior.
+El boton de restaurar vuelve a vertical y
 restablece las barras, sin recrear Activity ni mpv: conserva posicion y
 pausa. `src/screen.rs` solicita el cambio mediante JNI en el hilo UI Java,
 y el manifiesto declara los cambios de orientacion y tamano.
