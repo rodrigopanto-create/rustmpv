@@ -136,6 +136,7 @@ $quickJsLicenses = Join-Path $PSScriptRoot "android\app\build\generated\quickjsA
 New-Item -ItemType Directory -Force $quickJsLicenses | Out-Null
 Copy-Item (Join-Path $quickJsSource "LICENSE") (Join-Path $quickJsLicenses "quickjs-ng.txt") -Force
 
+& (Join-Path $PSScriptRoot "prepare-anonymous-provider.ps1")
 cargo ndk -t arm64-v8a --platform 24 -o "android\app\src\main\jniLibs" build -p app_android --release --lib --no-default-features --features chaquopy
 if ($LASTEXITCODE -ne 0) { throw "Fallo la compilacion Rust para Chaquopy." }
 & $gradle -p android ":app:assemble$Variant" --console=plain --no-daemon --max-workers=2
@@ -156,7 +157,13 @@ try {
     if ($alternateFiles.Count -gt 0) {
         throw "El APK contiene archivos de un backend Python alternativo: $($alternateFiles -join ', ')"
     }
-    foreach ($required in @("lib/arm64-v8a/libqjs.so", "assets/licenses/quickjs-ng.txt")) {
+    foreach ($required in @(
+        "lib/arm64-v8a/libqjs.so", "assets/licenses/quickjs-ng.txt",
+        "lib/arm64-v8a/libnode.so", "assets/anonymous-provider.zip",
+        "assets/licenses/bgutil-GPL-3.0.txt", "assets/licenses/nodejs.txt",
+        "assets/licenses/libffi.txt", "assets/licenses/libcxx.txt",
+        "assets/sources/bgutil-2.0.2.zip"
+    )) {
         if ($entries -notcontains $required) { throw "Falta $required en el APK." }
     }
     $requirementsEntry = $archive.GetEntry("assets/chaquopy/requirements-common.imy")
@@ -182,4 +189,4 @@ finally {
     $archive.Dispose()
 }
 Write-Host "APK: $outputApk"
-Write-Host "Verificado: un solo runtime Python, sin assets Python de subproceso; QuickJS-ng y EJS incluidos."
+Write-Host "Verificado: un solo runtime Python, sin assets Python de subproceso; QuickJS-ng, EJS y Node.js/bgutil con fuentes/licencias incluidos."

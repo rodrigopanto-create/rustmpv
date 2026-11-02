@@ -38,12 +38,16 @@ mod playback;
 mod prefetch;
 #[cfg(all(target_os = "android", feature = "native-python"))]
 mod python_ffi;
+#[cfg(any(all(target_os = "android", feature = "chaquopy"), test))]
+mod recovery;
 #[cfg(target_os = "android")]
 mod screen;
 #[cfg(any(target_os = "android", feature = "yt-dlp-subprocess", test))]
 mod stream_url;
 #[cfg(target_os = "android")]
 mod video;
+#[cfg(any(target_os = "android", test))]
+mod youtube;
 
 #[cfg(any(feature = "yt-dlp-subprocess", test))]
 mod yt_dlp_bundle;
@@ -98,6 +102,22 @@ struct AndroidAppState {
     url: String,
     mode: PlaybackMode,
     status: String,
+    #[cfg(feature = "chaquopy")]
+    cookie_state_request: Option<Receiver<Result<String, String>>>,
+    #[cfg(feature = "chaquopy")]
+    cookie_import_request: Option<Receiver<Result<String, String>>>,
+    #[cfg(feature = "chaquopy")]
+    cookie_clear_request: Option<Receiver<Result<String, String>>>,
+    #[cfg(feature = "chaquopy")]
+    cookie_status_request: Option<Receiver<Result<String, String>>>,
+    #[cfg(feature = "chaquopy")]
+    cookies_available: bool,
+    #[cfg(feature = "chaquopy")]
+    cookie_import_pending: bool,
+    #[cfg(feature = "chaquopy")]
+    cookie_poll_at: std::time::Instant,
+    #[cfg(feature = "chaquopy")]
+    cookie_notice: Option<(String, bool)>,
     /// Fallo de yt-dlp visible solo mientras la URL siga siendo la misma.
     resolve_error: Option<(String, String)>,
     playback: std::sync::Arc<std::sync::Mutex<playback::Playback>>,
@@ -112,7 +132,7 @@ struct AndroidAppState {
     keep_awake: bool,
     service_request: Option<Receiver<Result<(), String>>>,
     last_media: Option<(String, PlaybackMode, stream_url::MediaInfo)>,
-    discard_resolution: bool,
+    cancelled_input: Option<String>,
     last_resolved_at: Option<std::time::Instant>,
     #[cfg(feature = "chaquopy")]
     python_warmup: Option<chaquopy::Warmup>,
@@ -126,10 +146,56 @@ struct AndroidAppState {
     confirm_clear: bool,
     last_interaction: std::time::Instant,
     show_controls: bool,
+    muted: bool,
+    process_messages: std::collections::VecDeque<String>,
+    resolution_started: Option<std::time::Instant>,
+    youtube_session: bool,
+    session_input: String,
+    last_session: bool,
 }
 
 #[cfg(target_os = "android")]
 impl AndroidAppState {
+    fn update_session_choice(&mut self) {
+        if self.session_input != self.url.trim() {
+            #[cfg(feature = "chaquopy")]
+            if self.prefetch.pending()
+                || self
+                    .prefetch
+                    .ready()
+                    .is_some_and(|media| media.playlist_pending)
+                || self.stream_receiver.is_some()
+                || lifecycle::queue_pending()
+            {
+                chaquopy::cancel_pending();
+                lifecycle::invalidate_recovery();
+                self.prefetch = prefetch::Prefetcher::default();
+                self.stream_receiver = None;
+                self.stream_token = None;
+            }
+            self.session_input = self.url.trim().to_owned();
+            self.youtube_session = youtube::personalized(&self.session_input);
+        }
+    }
+
+    fn resolving(&self) -> bool {
+        self.stream_receiver.is_some() || self.playback.lock().expect("playback lock").recovering
+    }
+
+    fn process_pending(&self) -> bool {
+        #[cfg(feature = "chaquopy")]
+        if self.prefetch.pending()
+            || self
+                .prefetch
+                .ready()
+                .is_some_and(|media| media.playlist_pending)
+            || lifecycle::queue_pending()
+        {
+            return true;
+        }
+        self.resolving()
+    }
+
     fn new(
         android_app: winit::platform::android::activity::AndroidApp,
         gl: Option<&eframe::glow::Context>,
@@ -163,11 +229,29 @@ impl AndroidAppState {
         if let Err(error) = chaquopy::start_worker() {
             log::error!("No se pudo iniciar el worker Python: {error}");
         }
+        #[cfg(feature = "chaquopy")]
+        let cookie_state_request = Some(screen::has_supported_site_cookies(&android_app));
         Self {
             android_app,
             url: String::new(),
             mode: PlaybackMode::Audio,
             status,
+            #[cfg(feature = "chaquopy")]
+            cookie_state_request,
+            #[cfg(feature = "chaquopy")]
+            cookie_import_request: None,
+            #[cfg(feature = "chaquopy")]
+            cookie_clear_request: None,
+            #[cfg(feature = "chaquopy")]
+            cookie_status_request: None,
+            #[cfg(feature = "chaquopy")]
+            cookies_available: false,
+            #[cfg(feature = "chaquopy")]
+            cookie_import_pending: false,
+            #[cfg(feature = "chaquopy")]
+            cookie_poll_at: std::time::Instant::now(),
+            #[cfg(feature = "chaquopy")]
+            cookie_notice: None,
             resolve_error: None,
             playback,
             mpv_context,
@@ -181,7 +265,7 @@ impl AndroidAppState {
             keep_awake: false,
             service_request: None,
             last_media: None,
-            discard_resolution: false,
+            cancelled_input: None,
             last_resolved_at: None,
             #[cfg(feature = "chaquopy")]
             python_warmup: None,
@@ -194,6 +278,12 @@ impl AndroidAppState {
             confirm_clear: false,
             last_interaction: std::time::Instant::now(),
             show_controls: true,
+            muted: false,
+            process_messages: std::collections::VecDeque::new(),
+            resolution_started: None,
+            youtube_session: false,
+            session_input: String::new(),
+            last_session: false,
         }
     }
 }
@@ -218,6 +308,9 @@ fn system_bar_margins(content: [i32; 4], window: [i32; 2], pixels_per_point: f32
 impl eframe::App for AndroidAppState {
     /// Dibuja la interfaz Android y expone el formato directo elegido.
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        self.update_session_choice();
+        #[cfg(feature = "chaquopy")]
+        self.poll_cookie_auth(context);
         if screen::fullscreen()
             && self.screen_request.is_none()
             && context
@@ -245,13 +338,19 @@ impl eframe::App for AndroidAppState {
         self.poll_stream();
         #[cfg(feature = "chaquopy")]
         {
+            lifecycle::update_input(self.url.trim());
+        }
+        lifecycle::poll();
+        #[cfg(feature = "chaquopy")]
+        {
+            self.poll_recovery();
             self.poll_python_worker();
             self.poll_prefetch();
         }
         let previous = self.status.clone();
+        let process_pending = self.process_pending();
         let playback = {
             let mut playback = self.playback.lock().expect("playback lock");
-            playback.poll(self.mpv_context);
             history::observe(&playback);
             if let Some(video) = &self.video {
                 let error = video.lock().expect("video renderer lock").error.clone();
@@ -263,7 +362,7 @@ impl eframe::App for AndroidAppState {
                 }
                 self.video_error = error;
             }
-            if self.stream_receiver.is_none()
+            if !process_pending
                 && playback.status() != previous
                 && (playback.active
                     || playback.stopped
@@ -338,11 +437,12 @@ impl eframe::App for AndroidAppState {
                     )
                 })
         });
+        let playing_without_process = playback.is_playing() && !self.process_pending();
         controls::update_visibility(
             &mut self.last_interaction,
             &mut self.show_controls,
             now,
-            playback.is_playing(),
+            playing_without_process,
             interacting,
         );
         if self.show_controls && playback.is_playing() {
@@ -366,6 +466,12 @@ impl eframe::App for AndroidAppState {
             frame.inner_margin.top += margins.top;
             frame.inner_margin.right += margins.right;
             frame.inner_margin.bottom += margins.bottom;
+            if let Some(bottom) = screen::visible_bottom() {
+                frame.inner_margin.bottom = frame
+                    .inner_margin
+                    .bottom
+                    .max((window.height() - bottom).max(0) as f32 / context.pixels_per_point());
+            }
         }
         egui::CentralPanel::default()
             .frame(frame)
@@ -373,14 +479,19 @@ impl eframe::App for AndroidAppState {
                 if self.show_controls {
                     egui::TopBottomPanel::bottom("controls_panel")
                         .resizable(false)
-                        .exact_height(controls::CONTROL_SIZE + 12.0)
+                        .exact_height(controls::panel_height(ui.available_width()))
                         .frame(egui::Frame::none().inner_margin(egui::Margin::symmetric(0.0, 6.0)))
                         .show_inside(ui, |ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;
-                            ui.horizontal_centered(|ui| {
-                                self.draw_transport(ui);
-                                self.draw_seek(ui);
-                            });
+                            if controls::stacked(ui.available_width()) {
+                                ui.horizontal(|ui| self.draw_transport(ui));
+                                ui.horizontal(|ui| self.draw_seek(ui));
+                            } else {
+                                ui.horizontal_centered(|ui| {
+                                    self.draw_transport(ui);
+                                    self.draw_seek(ui);
+                                });
+                            }
                         });
                 }
                 if screen::fullscreen() {
@@ -389,8 +500,12 @@ impl eframe::App for AndroidAppState {
                     self.draw_video(ui, rect);
                     return;
                 }
+                egui::ScrollArea::vertical()
+                    .id_salt("player_content")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
                 ui.heading("VisualRustMPV Android");
-                ui.add_enabled_ui(self.stream_receiver.is_none(), |ui| {
+                ui.add_enabled_ui(!self.resolving(), |ui| {
                     ui.horizontal(|ui| {
                         let url_edit = ui.add(
                             egui::TextEdit::singleline(&mut self.url).hint_text("URL del medio"),
@@ -409,7 +524,86 @@ impl eframe::App for AndroidAppState {
                         }
                     });
                 });
-                ui.add_enabled_ui(self.stream_receiver.is_none(), |ui| {
+                #[cfg(feature = "chaquopy")]
+                {
+                    ui.add_enabled_ui(!self.resolving(), |ui| {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    !self.cookie_import_pending
+                                        && self.cookie_clear_request.is_none(),
+                                    egui::Button::new(if self.cookies_available {
+                                        "Cambiar cookies de fallback"
+                                    } else {
+                                        "Importar cookies de fallback"
+                                    }),
+                                )
+                                .clicked()
+                            {
+                                self.cookie_import_pending = true;
+                                self.cookie_poll_at = std::time::Instant::now()
+                                    + std::time::Duration::from_millis(300);
+                                self.cookie_import_request = Some(
+                                    screen::open_supported_site_cookies_file(&self.android_app),
+                                );
+                                self.cookie_notice = Some((
+                                    "Selecciona cookies.txt para YouTube, X/Twitter, Instagram o Facebook."
+                                        .to_owned(),
+                                    false,
+                                ));
+                                self.status = "Selecciona cookies.txt para YouTube, X/Twitter, Instagram o Facebook."
+                                    .to_owned();
+                            }
+                            if self.cookies_available
+                                && ui
+                                    .add_enabled(
+                                        !self.cookie_import_pending
+                                            && self.cookie_clear_request.is_none(),
+                                        egui::Button::new("Eliminar cookies guardadas"),
+                                    )
+                                    .clicked()
+                            {
+                                self.cookie_clear_request = Some(
+                                    screen::clear_supported_site_cookies(&self.android_app),
+                                );
+                            }
+                        });
+                    });
+                    if media_site(self.url.trim()) == Some(MediaSite::YouTube) {
+                        let choice = ui.add_enabled(
+                            !self.resolving(),
+                            egui::Checkbox::new(
+                                &mut self.youtube_session,
+                                "Usar mi sesion de YouTube / Music",
+                            ),
+                        );
+                        if choice.changed() {
+                            chaquopy::cancel_pending();
+                            lifecycle::invalidate_recovery();
+                            self.prefetch = prefetch::Prefetcher::default();
+                            self.stream_token = None;
+                            self.resolve_error = None;
+                            self.last_resolved_at = None;
+                        }
+                        if self.youtube_session {
+                            ui.weak("Sesion necesaria para conservar tus mixes y listas personales. Importa cookies de tu cuenta.");
+                        }
+                        ui.weak("Listas: hasta 100 elementos por carga; los no disponibles se indican y se omiten.");
+                    }
+                    ui.weak("En modo normal: primero sin cuenta (clientes automaticos + PO Token local); si falla, cookies.");
+                    ui.weak("El fallback usa tu sesion. No oculta tu IP ni garantiza acceso a todos los enlaces.");
+                    if self.cookies_available {
+                        ui.weak("Cookies cifradas; solo para este sitio al usar sesion o fallback.");
+                    }
+                    if let Some((notice, error)) = &self.cookie_notice {
+                        if *error {
+                            ui.colored_label(egui::Color32::LIGHT_RED, notice);
+                        } else {
+                            ui.weak(notice);
+                        }
+                    }
+                }
+                ui.add_enabled_ui(!self.resolving(), |ui| {
                     ui.horizontal(|ui| {
                         ui.selectable_value(&mut self.mode, PlaybackMode::Video, "Video MP4");
                         ui.selectable_value(&mut self.mode, PlaybackMode::Audio, "Audio directo");
@@ -431,12 +625,33 @@ impl eframe::App for AndroidAppState {
                         }
                     });
                 });
-                if self.stream_receiver.is_some()
+                if self.process_pending()
                     || (playback.active
                         && playback.error.is_none()
                         && (!playback.loaded || !playback.started || playback.buffering))
                 {
                     controls::loading_bar(ui);
+                }
+                ui.label(&self.status);
+                if self.process_pending() {
+                    if let Some(started) = self.resolution_started {
+                        ui.weak(format!(
+                            "Proceso en curso: {:.0} s. Espera el resultado o cancela para probar otra URL.",
+                            started.elapsed().as_secs_f64()
+                        ));
+                    }
+                    if ui.button("Cancelar proceso y volver al player").clicked() {
+                        self.cancel_process();
+                    }
+                }
+                if !self.process_messages.is_empty() {
+                    egui::CollapsingHeader::new("Consola del proceso")
+                        .default_open(self.process_pending())
+                        .show(ui, |ui| {
+                            for message in &self.process_messages {
+                                ui.label(egui::RichText::new(message).monospace().small());
+                            }
+                        });
                 }
                 if let Some(error) = &self.video_error {
                     ui.colored_label(egui::Color32::LIGHT_RED, format!("Video: {error}"));
@@ -458,6 +673,7 @@ impl eframe::App for AndroidAppState {
                     self.draw_video(ui, rect);
                 }
                 self.draw_history(ui);
+                    });
             });
         if self.mpv_context != 0 {
             let interval = if self.playing_mode == PlaybackMode::Video {
@@ -478,15 +694,222 @@ impl eframe::App for AndroidAppState {
 
 #[cfg(target_os = "android")]
 impl AndroidAppState {
+    #[cfg(feature = "chaquopy")]
+    fn poll_cookie_auth(&mut self, context: &egui::Context) {
+        let state =
+            self.cookie_state_request
+                .as_ref()
+                .and_then(|receiver| match receiver.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        Some(Err("La consulta de cookies se desconecto".to_owned()))
+                    }
+                    Err(mpsc::TryRecvError::Empty) => None,
+                });
+        if let Some(result) = state {
+            self.cookie_state_request = None;
+            match result {
+                Ok(value) if value == "available" => self.cookies_available = true,
+                Ok(value) if value == "empty" => self.cookies_available = false,
+                Ok(value) => {
+                    log::error!("Estado de cookies inesperado: {value}");
+                    self.cookie_notice =
+                        Some((format!("Estado de cookies inesperado: {value}"), true));
+                    self.status = format!("Estado de cookies inesperado: {value}");
+                }
+                Err(error) => {
+                    log::error!("Consultar cookies guardadas: {error}");
+                    self.cookie_notice = Some((
+                        format!("No se pudieron consultar las cookies guardadas: {error}"),
+                        true,
+                    ));
+                    self.status =
+                        format!("No se pudieron consultar las cookies guardadas: {error}");
+                }
+            }
+        }
+
+        let import =
+            self.cookie_import_request
+                .as_ref()
+                .and_then(|receiver| match receiver.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        Some(Err("El selector de archivos se desconecto".to_owned()))
+                    }
+                    Err(mpsc::TryRecvError::Empty) => None,
+                });
+        if let Some(result) = import {
+            self.cookie_import_request = None;
+            match result {
+                Ok(value) if value == "opened" => {}
+                Ok(value) => {
+                    self.cookie_import_pending = false;
+                    log::error!("Respuesta inesperada al abrir cookies: {value}");
+                    self.cookie_notice = Some((
+                        format!("No se pudo abrir el selector de cookies: {value}"),
+                        true,
+                    ));
+                    self.status = format!("No se pudo abrir el selector de cookies: {value}");
+                }
+                Err(error) => {
+                    self.cookie_import_pending = false;
+                    log::error!("Abrir selector de cookies: {error}");
+                    self.cookie_notice = Some((
+                        format!("No se pudo abrir el selector de archivos: {error}"),
+                        true,
+                    ));
+                    self.status = format!("No se pudo abrir el selector de archivos: {error}");
+                }
+            }
+        }
+
+        let clear =
+            self.cookie_clear_request
+                .as_ref()
+                .and_then(|receiver| match receiver.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        Some(Err("La eliminacion de cookies se desconecto".to_owned()))
+                    }
+                    Err(mpsc::TryRecvError::Empty) => None,
+                });
+        if let Some(result) = clear {
+            self.cookie_clear_request = None;
+            match result {
+                Ok(value) if value == "deleted" => {
+                    self.cookies_available = false;
+                    self.cookie_notice = Some(("Cookies guardadas eliminadas".to_owned(), false));
+                    self.status = "Cookies guardadas eliminadas".to_owned();
+                }
+                Ok(value) => {
+                    log::error!("Respuesta inesperada al eliminar cookies: {value}");
+                    self.cookie_notice = Some((
+                        format!("No se pudieron eliminar las cookies: {value}"),
+                        true,
+                    ));
+                    self.status = format!("No se pudieron eliminar las cookies: {value}");
+                }
+                Err(error) => {
+                    log::error!("Eliminar cookies guardadas: {error}");
+                    self.cookie_notice = Some((
+                        format!("No se pudieron eliminar las cookies: {error}"),
+                        true,
+                    ));
+                    self.status = format!("No se pudieron eliminar las cookies: {error}");
+                }
+            }
+        }
+
+        let cookie_status = self
+            .cookie_status_request
+            .as_ref()
+            .and_then(|receiver| match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("La importacion de cookies se desconecto".to_owned()))
+                }
+                Err(mpsc::TryRecvError::Empty) => None,
+            });
+        if let Some(result) = cookie_status {
+            self.cookie_status_request = None;
+            match result {
+                Ok(status) if status.is_empty() => {}
+                Ok(status) => {
+                    self.cookie_import_pending = false;
+                    match status.as_str() {
+                        "fallback" => {
+                            self.cookie_notice = Some((
+                                "El intento anonimo fallo; se reintenta usando tu sesion guardada."
+                                    .to_owned(),
+                                false,
+                            ));
+                        }
+                        "session" => {
+                            self.cookie_notice = Some((
+                                "Resolviendo la lista con tu sesion de YouTube / Music.".to_owned(),
+                                false,
+                            ));
+                        }
+                        "imported" => {
+                            self.cookies_available = true;
+                            self.cookie_notice = Some((
+                                "Cookies protegidas; se usaran solo si falla el intento anonimo."
+                                    .to_owned(),
+                                false,
+                            ));
+                            self.status =
+                                "Cookies protegidas; se usaran solo si falla el intento anonimo."
+                                    .to_owned();
+                        }
+                        "invalid" => {
+                            self.cookie_notice = Some((
+                                "Archivo invalido: requiere cookies de sitios compatibles en formato Netscape."
+                                    .to_owned(),
+                                true,
+                            ));
+                            self.status = "Archivo invalido: requiere cookies de sitios compatibles en formato Netscape."
+                                .to_owned();
+                        }
+                        "error" => {
+                            self.cookie_notice =
+                                Some(("No se pudieron guardar las cookies".to_owned(), true));
+                            self.status = "No se pudieron guardar las cookies".to_owned();
+                        }
+                        "cancelled" => {
+                            self.cookie_notice =
+                                Some(("Importacion de cookies cancelada".to_owned(), false));
+                            self.status = "Importacion de cookies cancelada".to_owned();
+                        }
+                        "deleted" => {
+                            self.cookies_available = false;
+                            self.cookie_notice =
+                                Some(("Cookies guardadas eliminadas".to_owned(), false));
+                            self.status = "Cookies guardadas eliminadas".to_owned();
+                        }
+                        _ => {
+                            log::error!("Estado de importacion inesperado: {status}");
+                            self.cookie_notice =
+                                Some((format!("Estado de importacion inesperado: {status}"), true));
+                            self.status = format!("Estado de importacion inesperado: {status}");
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.cookie_import_pending = false;
+                    log::error!("Consultar resultado de cookies: {error}");
+                    self.cookie_notice = Some((
+                        format!("No se pudo leer el resultado de cookies: {error}"),
+                        true,
+                    ));
+                    self.status = format!("No se pudo leer el resultado de cookies: {error}");
+                }
+            }
+        }
+
+        if self.cookie_status_request.is_none() && std::time::Instant::now() >= self.cookie_poll_at
+        {
+            self.cookie_status_request = Some(screen::take_supported_site_cookies_status(
+                &self.android_app,
+            ));
+            self.cookie_poll_at = std::time::Instant::now() + std::time::Duration::from_millis(300);
+            context.request_repaint_after(std::time::Duration::from_millis(300));
+        }
+    }
+
     fn draw_transport(&mut self, ui: &mut egui::Ui) {
         use controls::{Icon, button};
         let playback = self.playback.lock().expect("playback lock").clone();
-        let pending = self.stream_receiver.is_some();
-        if button(ui, Icon::Play, "Reproducir / Reanudar", !pending).clicked() {
+        let pending = self.process_pending();
+        let can_play = !self.resolving();
+        #[cfg(feature = "chaquopy")]
+        let can_play = can_play && (!lifecycle::queue_pending() || playback.active);
+        if button(ui, Icon::Play, "Reproducir / Reanudar", can_play).clicked() {
             let same_media = self
                 .last_media
                 .as_ref()
-                .is_some_and(|(input, mode, _)| input == self.url.trim() && *mode == self.mode);
+                .is_some_and(|(input, mode, _)| input == self.url.trim() && *mode == self.mode)
+                && self.last_session == self.youtube_session;
             if same_media && playback.active && playback.loaded {
                 self.run_player_command(&["set", "pause", "no"]);
             } else {
@@ -497,19 +920,38 @@ impl AndroidAppState {
             ui,
             Icon::Pause,
             "Pausar",
-            playback.active && playback.loaded && !playback.paused,
+            ((playback.active && playback.loaded) || playback.recovering) && !playback.paused,
         )
         .clicked()
         {
             self.run_player_command(&["set", "pause", "yes"]);
         }
-        if button(ui, Icon::Stop, "Detener", playback.active || pending).clicked() {
-            self.discard_resolution = pending;
-            if self.run_player_command(&["stop"]) {
-                let mut playback = self.playback.lock().expect("playback lock");
-                playback.stop();
-                self.seek_position = None;
-                self.status = playback.status();
+        if button(
+            ui,
+            Icon::Stop,
+            "Detener / Cancelar",
+            playback.active || pending,
+        )
+        .clicked()
+        {
+            self.cancel_process();
+        }
+        if button(
+            ui,
+            if self.muted { Icon::Muted } else { Icon::Sound },
+            if self.muted {
+                "Sonido OFF: activar"
+            } else {
+                "Sonido ON: silenciar"
+            },
+            self.mpv_context != 0,
+        )
+        .clicked()
+        {
+            let muted = !self.muted;
+            if self.run_player_command(&["set", "mute", if muted { "yes" } else { "no" }]) {
+                self.muted = muted;
+                self.process_message(if muted { "Sonido OFF" } else { "Sonido ON" }.to_owned());
             }
         }
         let fullscreen = screen::fullscreen();
@@ -596,53 +1038,48 @@ impl AndroidAppState {
                 }
             });
         });
-        let enabled = self.stream_receiver.is_none();
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for entry in &self.history {
-                    ui.horizontal(|ui| {
-                        if ui.small_button("🗙").on_hover_text("Quitar").clicked() {
-                            remove = Some(entry.key.clone());
-                        }
-                        ui.vertical(|ui| {
-                            let title = ui.add_enabled(
-                                enabled,
-                                egui::Label::new(entry.label())
-                                    .truncate()
-                                    .sense(egui::Sense::click()),
-                            );
-                            let duration = entry.duration.filter(|value| value.is_finite());
-                            let progress = if entry.finished() {
-                                "visto".to_owned()
-                            } else if let (Some(position), Some(duration)) =
-                                (entry.resume_position(), duration)
-                            {
-                                format!(
-                                    "continuar en {} / {}",
-                                    controls::clock(position),
-                                    controls::clock(duration)
-                                )
-                            } else {
-                                duration.map(controls::clock).unwrap_or_default()
-                            };
-                            let mode = if entry.audio_only { "Audio" } else { "Video" };
-                            let details = [mode, entry.artist.as_str(), progress.as_str()]
-                                .into_iter()
-                                .filter(|part| !part.is_empty())
-                                .collect::<Vec<_>>()
-                                .join(" · ");
-                            ui.add(
-                                egui::Label::new(egui::RichText::new(details).weak().small())
-                                    .truncate(),
-                            );
-                            if title.clicked() {
-                                play = Some((entry.input.clone(), entry.audio_only));
-                            }
-                        });
-                    });
+        let enabled = !self.resolving();
+        for entry in &self.history {
+            ui.horizontal(|ui| {
+                if ui.small_button("🗙").on_hover_text("Quitar").clicked() {
+                    remove = Some(entry.key.clone());
                 }
+                ui.vertical(|ui| {
+                    let title = ui.add_enabled(
+                        enabled,
+                        egui::Label::new(entry.label())
+                            .truncate()
+                            .sense(egui::Sense::click()),
+                    );
+                    let duration = entry.duration.filter(|value| value.is_finite());
+                    let progress = if entry.finished() {
+                        "visto".to_owned()
+                    } else if let (Some(position), Some(duration)) =
+                        (entry.resume_position(), duration)
+                    {
+                        format!(
+                            "continuar en {} / {}",
+                            controls::clock(position),
+                            controls::clock(duration)
+                        )
+                    } else {
+                        duration.map(controls::clock).unwrap_or_default()
+                    };
+                    let mode = if entry.audio_only { "Audio" } else { "Video" };
+                    let details = [mode, entry.artist.as_str(), progress.as_str()]
+                        .into_iter()
+                        .filter(|part| !part.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" · ");
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(details).weak().small()).truncate(),
+                    );
+                    if title.clicked() {
+                        play = Some((entry.input.clone(), entry.audio_only));
+                    }
+                });
             });
+        }
         if let Some(key) = remove {
             history::remove(&key);
         }
@@ -685,10 +1122,49 @@ impl AndroidAppState {
             self.status = error;
             return false;
         }
+        if let ["set", "pause", value] = args {
+            lifecycle::set_paused(*value == "yes");
+        }
         true
     }
 
+    fn process_message(&mut self, message: String) {
+        if self.process_messages.back() == Some(&message) {
+            return;
+        }
+        log::info!("Player: {message}");
+        if self.process_messages.len() == 12 {
+            self.process_messages.pop_front();
+        }
+        self.process_messages.push_back(message);
+    }
+
+    fn cancel_process(&mut self) {
+        // Release the UI immediately; a cancelled worker can never load its late result.
+        self.stream_receiver = None;
+        self.resolution_started = None;
+        self.cancelled_input = Some(self.url.trim().to_owned());
+        self.resolve_error = None;
+        #[cfg(feature = "chaquopy")]
+        {
+            self.prefetch = prefetch::Prefetcher::default();
+            self.stream_token = None;
+        }
+        lifecycle::cancel();
+        self.seek_position = None;
+        if self.run_player_command(&["stop"]) {
+            self.status = "Proceso cancelado. Puedes introducir otra URL.".to_owned();
+        }
+        self.process_message(self.status.clone());
+        if screen::fullscreen() && self.screen_request.is_none() {
+            self.screen_request = Some(screen::request(&self.android_app, false));
+        }
+    }
+
     fn load_resolved_stream(&mut self, media: stream_url::MediaInfo) {
+        if !media.playlist_notice.is_empty() {
+            self.process_message(media.playlist_notice.clone());
+        }
         let queued = media.playlist.clone();
         let mut playback = self.playback.lock().expect("playback lock");
         playback.poll(self.mpv_context);
@@ -700,12 +1176,7 @@ impl AndroidAppState {
             &media.title,
             &media.artist,
         );
-        let loaded = load_stream(self.mpv_context, &media.url, self.mode, resume).and_then(|()| {
-            for url in &queued {
-                append_stream(self.mpv_context, url, self.mode)?;
-            }
-            Ok(())
-        });
+        let loaded = load_media(self.mpv_context, &media, self.mode, resume, false);
         match loaded {
             Ok(()) => {
                 playback.loading();
@@ -720,10 +1191,13 @@ impl AndroidAppState {
                     log::info!("Lista encolada: {} elementos", queued.len() + 1);
                 }
                 drop(playback);
+                #[cfg(feature = "chaquopy")]
+                lifecycle::begin_media(self.url.trim(), self.mode, media.clone());
                 lifecycle::set_video(self.mode == PlaybackMode::Video);
                 self.service_request =
                     Some(screen::start_playback_service(&self.android_app, &media));
                 self.last_media = Some((self.url.trim().to_owned(), self.mode, media));
+                self.last_session = self.youtube_session;
             }
             Err(error) => {
                 log::error!("Cargar stream: {error}");
@@ -733,13 +1207,61 @@ impl AndroidAppState {
         }
     }
 
+    #[cfg(feature = "chaquopy")]
+    fn poll_recovery(&mut self) {
+        let Some((input, mode, updates)) = lifecycle::take_recovery_updates() else {
+            return;
+        };
+        for update in updates {
+            self.last_resolved_at = None;
+            self.prefetch = prefetch::Prefetcher::default();
+            self.stream_token = None;
+            match update {
+                recovery::Update::Started(notice) => {
+                    self.resolution_started = Some(std::time::Instant::now());
+                    self.process_message(notice.clone());
+                    self.cookie_notice = Some((notice.clone(), false));
+                    self.status = notice;
+                }
+                recovery::Update::Loaded(media) => {
+                    self.last_resolved_at = Some(std::time::Instant::now());
+                    self.last_media = Some((input.clone(), mode, media));
+                    self.seek_position = None;
+                }
+                recovery::Update::Extended(media) => {
+                    if !media.playlist_pending {
+                        self.last_resolved_at = Some(std::time::Instant::now());
+                    }
+                    self.process_message(media.playlist_notice.clone());
+                    self.last_media = Some((input.clone(), mode, media));
+                }
+                recovery::Update::QueueFailed(error) => {
+                    self.process_message(error.clone());
+                    self.resolve_error = Some((input.clone(), error));
+                }
+                recovery::Update::Failed(error) => {
+                    self.resolve_error = Some((input.clone(), error));
+                }
+                recovery::Update::Cancelled => {}
+            }
+        }
+    }
+
     /// Resuelve YouTube, X/Twitter, Instagram o Facebook en segundo plano o acepta una URL directa.
     fn resolve_and_play(&mut self) {
+        self.update_session_choice();
         if self.url.trim().is_empty() {
             self.status = "Introduce una URL".to_owned();
             return;
         }
         let input = self.url.trim().to_owned();
+        self.cancelled_input = None;
+        self.resolution_started = Some(std::time::Instant::now());
+        self.process_message("Encolando resolucion del enlace...".to_owned());
+        #[cfg(feature = "chaquopy")]
+        {
+            lifecycle::invalidate_recovery();
+        }
         self.resolve_error = None;
         if self.mode == PlaybackMode::Video {
             if let Some(error) = &self.video_error {
@@ -749,7 +1271,7 @@ impl AndroidAppState {
         }
         let audio_only = self.mode == PlaybackMode::Audio;
         if let Some((source, mode, media)) = &self.last_media {
-            if source == &input && *mode == self.mode {
+            if source == &input && *mode == self.mode && self.last_session == self.youtube_session {
                 if self.playback.lock().expect("playback lock").error.is_none()
                     && self
                         .last_resolved_at
@@ -761,25 +1283,30 @@ impl AndroidAppState {
                 }
             }
         }
-        self.discard_resolution = false;
         if is_http_url(&input) && !needs_resolver(&input) {
             self.stream_receiver = None;
             self.last_resolved_at = Some(std::time::Instant::now());
             self.load_resolved_stream(stream_url::MediaInfo::direct(input));
             return;
         }
+
         #[cfg(feature = "chaquopy")]
         {
             let key = prefetch::Key {
                 input: input.clone(),
                 audio_only,
+                session: self.youtube_session,
             };
             match self.prefetch.take(&key, std::time::Instant::now()) {
-                prefetch::Taken::Ready(media, resolved_at) => {
+                prefetch::Taken::Ready(media, resolved_at, receiver, _token) => {
                     log::info!("Play usa el enlace precargado");
                     self.stream_receiver = None;
-                    self.last_resolved_at = Some(resolved_at);
+                    let pending = media.playlist_pending;
+                    self.last_resolved_at = (!pending).then_some(resolved_at);
                     self.load_resolved_stream(media);
+                    if pending {
+                        lifecycle::continue_queue(receiver);
+                    }
                     return;
                 }
                 prefetch::Taken::Pending(receiver, token) => {
@@ -791,14 +1318,19 @@ impl AndroidAppState {
                 }
                 prefetch::Taken::None => {}
             }
-            match chaquopy::extract_stream_url(&input, audio_only) {
+            match chaquopy::extract_stream_url(&input, audio_only, self.youtube_session) {
                 Ok(receiver) => {
                     self.stream_receiver = Some(receiver);
                     self.status = "Resolviendo con yt-dlp (Chaquopy)...".to_owned();
                 }
                 Err(error) => {
                     log::error!("No se pudo iniciar Chaquopy: {error}");
-                    self.status = error;
+                    self.resolve_error = Some((input.clone(), user_facing_error(&error)));
+                    self.status = format!(
+                        "No se pudo iniciar la resolucion: {}",
+                        user_facing_error(&error)
+                    );
+                    self.process_message(self.status.clone());
                 }
             }
         }
@@ -903,6 +1435,12 @@ impl AndroidAppState {
     /// Refleja en el estado inicial cuando el worker Python termina la precarga.
     #[cfg(feature = "chaquopy")]
     fn poll_python_worker(&mut self) {
+        for message in chaquopy::take_progress() {
+            if self.process_pending() {
+                self.status = message.clone();
+            }
+            self.process_message(message);
+        }
         if self.stream_receiver.is_none() {
             if let Some(notice) = chaquopy::take_notice() {
                 self.status = notice;
@@ -936,7 +1474,10 @@ impl AndroidAppState {
     /// Resuelve YouTube mientras el usuario aun no pulsa Play.
     #[cfg(feature = "chaquopy")]
     fn poll_prefetch(&mut self) {
-        if self.stream_receiver.is_none() {
+        if lifecycle::queue_pending() {
+            return;
+        }
+        if !self.resolving() {
             self.stream_token = None;
         } else {
             // Play ya esta esperando; la URL y el modo no pueden cambiar.
@@ -949,18 +1490,32 @@ impl AndroidAppState {
             .last_media
             .as_ref()
             .is_some_and(|(source, mode, _)| source == input && *mode == self.mode)
-            && self
-                .last_resolved_at
-                .is_some_and(|time| time.elapsed() < prefetch::TTL);
-        let eligible =
-            needs_resolver(input) && !already_loaded && (audio_only || self.video_error.is_none());
+            && self.last_session == self.youtube_session
+            && (self.playback.lock().expect("playback lock").stopped
+                || self
+                    .last_resolved_at
+                    .is_some_and(|time| time.elapsed() < prefetch::TTL));
+        let blocked = self
+            .resolve_error
+            .as_ref()
+            .is_some_and(|(source, _)| source == input)
+            || self.cancelled_input.as_deref() == Some(input);
+        let eligible = needs_resolver(input)
+            && !already_loaded
+            && !blocked
+            && (audio_only || self.video_error.is_none());
         let key = eligible.then(|| prefetch::Key {
             input: input.to_owned(),
             audio_only,
+            session: self.youtube_session,
         });
         if let Some(key) = self.prefetch.observe(key, now) {
+            self.resolution_started = Some(now);
+            self.process_message(
+                "Precargando el enlace; puedes pulsar Play o cancelar.".to_owned(),
+            );
             log::info!("Precargando enlace antes de Play");
-            match chaquopy::prefetch(&key.input, key.audio_only) {
+            match chaquopy::prefetch(&key.input, key.audio_only, key.session) {
                 Ok((receiver, token)) => self.prefetch.start(key, receiver, token),
                 Err(error) => {
                     log::error!("No se pudo encolar la precarga: {error}");
@@ -976,7 +1531,15 @@ impl AndroidAppState {
                     self.status = "Enlace listo · pulsa Reproducir".to_owned();
                 }
             }
-            Some(Err(error)) => log::error!("Precarga fallida (Play reintentara): {error}"),
+            Some(Err(error)) => {
+                log::error!("Precarga fallida (Play reintentara): {error}");
+                self.resolve_error = Some((self.url.trim().to_owned(), user_facing_error(&error)));
+                self.status = format!(
+                    "No se pudo resolver la precarga: {}",
+                    user_facing_error(&error)
+                );
+                self.process_message(self.status.clone());
+            }
             None => {}
         }
     }
@@ -987,31 +1550,37 @@ impl AndroidAppState {
             return;
         };
         let result = receiver.try_recv();
-        if self.discard_resolution && !matches!(result, Err(mpsc::TryRecvError::Empty)) {
-            if let Ok(Err(error)) = &result {
-                log::error!("Resolver cancelado termino con error: {error}");
-            }
-            self.stream_receiver = None;
-            self.discard_resolution = false;
-            log::info!("Resultado yt-dlp descartado por Detener");
-            return;
-        }
         match result {
             Ok(Ok(media)) => {
+                #[cfg(feature = "chaquopy")]
+                let continuation = media
+                    .playlist_pending
+                    .then(|| self.stream_receiver.take().expect("stream receiver"));
                 self.stream_receiver = None;
-                self.last_resolved_at = Some(std::time::Instant::now());
+                self.last_resolved_at = (!media.playlist_pending).then(std::time::Instant::now);
                 self.load_resolved_stream(media);
+                #[cfg(feature = "chaquopy")]
+                if let Some(receiver) = continuation {
+                    lifecycle::continue_queue(receiver);
+                }
             }
             Ok(Err(error)) => {
                 log::error!("No se pudo resolver el enlace: {error}");
                 self.stream_receiver = None;
                 self.status = format!("No se pudo resolver el enlace: {error}");
                 self.resolve_error = Some((self.url.trim().to_owned(), user_facing_error(&error)));
+                self.process_message(format!(
+                    "No se pudo resolver el enlace: {}",
+                    user_facing_error(&error)
+                ));
             }
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.stream_receiver = None;
                 self.status = "yt-dlp terminó inesperadamente".to_owned();
+                log::error!("{}", self.status);
+                self.resolve_error = Some((self.url.trim().to_owned(), self.status.clone()));
+                self.process_message(self.status.clone());
             }
         }
     }
@@ -1370,19 +1939,7 @@ fn needs_resolver(input: &str) -> bool {
 
 #[cfg(any(test, all(target_os = "android", feature = "yt-dlp-subprocess")))]
 fn is_youtube_playlist_url(input: &str) -> bool {
-    let Ok(url) = url::Url::parse(input) else {
-        return false;
-    };
-    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-    let supported_host = host == "youtu.be"
-        || host == "youtube.com"
-        || host.ends_with(".youtube.com")
-        || host == "youtube-nocookie.com"
-        || host.ends_with(".youtube-nocookie.com");
-    supported_host
-        && url
-            .query_pairs()
-            .any(|(key, value)| key == "list" && !value.is_empty())
+    youtube::collection(input)
 }
 
 /// Inicializa la instancia nativa de libmpv enlazada en el APK.
@@ -1554,6 +2111,7 @@ fn load_stream(
     stream_url: &str,
     mode: PlaybackMode,
     start: Option<f64>,
+    paused: bool,
 ) -> Result<(), String> {
     let stream_url = stream_url::validate_stream_url(stream_url)?;
     let mut options = if mode == PlaybackMode::Video {
@@ -1564,7 +2122,10 @@ fn load_stream(
     if let Some(start) = start {
         options.push_str(&format!(",start={start:.3}"));
     }
-    send_mpv_command(context, &["set", "pause", "no"])?;
+    send_mpv_command(
+        context,
+        &["set", "pause", if paused { "yes" } else { "no" }],
+    )?;
     send_mpv_command(
         context,
         &["loadfile", &stream_url, "replace", "-1", &options],
@@ -1573,6 +2134,21 @@ fn load_stream(
         "URL directa enviada a libmpv mediante loadfile ({mode:?}, inicio {})",
         start.map_or("0".to_owned(), |start| format!("{start:.1} s"))
     );
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+fn load_media(
+    context: usize,
+    media: &stream_url::MediaInfo,
+    mode: PlaybackMode,
+    start: Option<f64>,
+    paused: bool,
+) -> Result<(), String> {
+    load_stream(context, &media.url, mode, start, paused)?;
+    for url in &media.playlist {
+        append_stream(context, url, mode)?;
+    }
     Ok(())
 }
 
@@ -1648,7 +2224,7 @@ pub fn desktop_placeholder() -> &'static str {
 #[cfg(test)]
 mod layout_tests {
     use super::{
-        is_youtube_playlist_url, media_site, system_bar_margins, user_facing_error, MediaSite,
+        MediaSite, is_youtube_playlist_url, media_site, system_bar_margins, user_facing_error,
     };
     use eframe::egui;
 
@@ -1730,12 +2306,21 @@ mod layout_tests {
     fn routes_social_video_sites_to_yt_dlp() {
         for (url, site) in [
             ("https://youtu.be/abcdefghijk", MediaSite::YouTube),
-            ("https://m.youtube.com/watch?v=abcdefghijk", MediaSite::YouTube),
+            (
+                "https://m.youtube.com/watch?v=abcdefghijk",
+                MediaSite::YouTube,
+            ),
             ("https://x.com/user/status/1", MediaSite::Twitter),
-            ("https://mobile.twitter.com/user/status/1", MediaSite::Twitter),
+            (
+                "https://mobile.twitter.com/user/status/1",
+                MediaSite::Twitter,
+            ),
             ("https://www.instagram.com/reel/abc/", MediaSite::Instagram),
             ("https://instagr.am/p/abc/", MediaSite::Instagram),
-            ("https://www.facebook.com/user/videos/1/", MediaSite::Facebook),
+            (
+                "https://www.facebook.com/user/videos/1/",
+                MediaSite::Facebook,
+            ),
             ("https://m.facebook.com/watch/?v=1", MediaSite::Facebook),
             ("https://fb.watch/abc/", MediaSite::Facebook),
             ("HTTPS://WWW.X.COM./user/status/1", MediaSite::Twitter),

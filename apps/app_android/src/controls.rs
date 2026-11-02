@@ -5,6 +5,14 @@ use std::time::{Duration, Instant};
 pub const HIDE_AFTER: Duration = Duration::from_secs(3);
 pub const CONTROL_SIZE: f32 = 40.0;
 
+pub fn stacked(width: f32) -> bool {
+    width < 520.0
+}
+
+pub fn panel_height(width: f32) -> f32 {
+    CONTROL_SIZE + 12.0 + if stacked(width) { 24.0 } else { 0.0 }
+}
+
 pub fn update_visibility(
     last_interaction: &mut Instant,
     show_controls: &mut bool,
@@ -28,6 +36,8 @@ pub enum Icon {
     Stop,
     Fullscreen,
     Restore,
+    Sound,
+    Muted,
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -70,6 +80,46 @@ pub fn button(ui: &mut egui::Ui, icon: Icon, label: &str, enabled: bool) -> egui
                 0.0,
                 color,
             );
+        }
+        Icon::Sound | Icon::Muted => {
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    center + egui::vec2(-10.0, -4.0),
+                    center + egui::vec2(-5.0, -4.0),
+                    center + egui::vec2(1.0, -9.0),
+                    center + egui::vec2(1.0, 9.0),
+                    center + egui::vec2(-5.0, 4.0),
+                    center + egui::vec2(-10.0, 4.0),
+                ],
+                color,
+                egui::Stroke::NONE,
+            ));
+            if matches!(icon, Icon::Muted) {
+                for direction in [-1.0, 1.0] {
+                    painter.line_segment(
+                        [
+                            center + egui::vec2(5.0, -5.0 * direction),
+                            center + egui::vec2(13.0, 5.0 * direction),
+                        ],
+                        (2.0, color),
+                    );
+                }
+            } else {
+                painter.line_segment(
+                    [
+                        center + egui::vec2(7.0, -7.0),
+                        center + egui::vec2(11.0, 0.0),
+                    ],
+                    (2.0, color),
+                );
+                painter.line_segment(
+                    [
+                        center + egui::vec2(11.0, 0.0),
+                        center + egui::vec2(7.0, 7.0),
+                    ],
+                    (2.0, color),
+                );
+            }
         }
         Icon::Fullscreen | Icon::Restore => {
             for x in [-1.0, 1.0] {
@@ -232,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn controls_share_a_single_row_and_seek_expands_without_overflow() {
+    fn controls_and_seek_fit_narrow_and_wide_layouts() {
         for width in [320.0, 360.0, 800.0] {
             for (duration, timer) in [
                 (Some(120.0), "0:10 / 2:00"),
@@ -251,19 +301,24 @@ mod tests {
                     },
                     |context| {
                         egui::TopBottomPanel::bottom("controls_panel")
-                            .exact_height(CONTROL_SIZE + 12.0)
+                            .exact_height(panel_height(width))
                             .frame(
                                 egui::Frame::none().inner_margin(egui::Margin::symmetric(0.0, 6.0)),
                             )
                             .show(context, |ui| {
                                 ui.spacing_mut().item_spacing.x = 4.0;
                                 let right = ui.max_rect().right();
-                                let row = ui.horizontal_centered(|ui| {
+                                let draw_buttons = |ui: &mut egui::Ui| {
                                     let mut buttons = Vec::new();
                                     for icon in [
                                         Icon::Play,
                                         Icon::Pause,
                                         Icon::Stop,
+                                        if width > 400.0 {
+                                            Icon::Sound
+                                        } else {
+                                            Icon::Muted
+                                        },
                                         if width > 400.0 {
                                             Icon::Restore
                                         } else {
@@ -271,6 +326,16 @@ mod tests {
                                         },
                                     ] {
                                         buttons.push(button(ui, icon, "Control", true).rect);
+                                    }
+                                    buttons
+                                };
+                                let mut buttons = Vec::new();
+                                if stacked(width) {
+                                    buttons = ui.horizontal(draw_buttons).inner;
+                                }
+                                let row = ui.horizontal_centered(|ui| {
+                                    if !stacked(width) {
+                                        buttons = draw_buttons(ui);
                                     }
                                     let mut position = 10.0;
                                     let slider = seek(
@@ -283,9 +348,14 @@ mod tests {
                                     slider_width = slider.rect.width();
                                     for rect in buttons {
                                         assert_eq!(rect.size(), egui::Vec2::splat(CONTROL_SIZE));
-                                        assert!(
-                                            (rect.center().y - slider.rect.center().y).abs() < 1.0
-                                        );
+                                        if stacked(width) {
+                                            assert!(rect.bottom() <= slider.rect.top());
+                                        } else {
+                                            assert!(
+                                                (rect.center().y - slider.rect.center().y).abs()
+                                                    < 1.0
+                                            );
+                                        }
                                     }
                                     assert!(ui.available_width() < 1.0);
                                 });
@@ -308,5 +378,39 @@ mod tests {
         assert_eq!(clock(3661.0), "1:01:01");
         assert_eq!(clock(f64::NAN), "0:00");
         assert_eq!(clock(-1.0), "0:00");
+    }
+
+    #[test]
+    fn scrolling_content_never_overlaps_controls_with_keyboard_sized_viewport() {
+        for height in [240.0, 480.0, 800.0] {
+            let context = egui::Context::default();
+            let _ = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(360.0, height),
+                    )),
+                    ..Default::default()
+                },
+                |context| {
+                    egui::CentralPanel::default().show(context, |ui| {
+                        let panel = egui::TopBottomPanel::bottom("controls")
+                            .exact_height(panel_height(ui.available_width()))
+                            .show_inside(ui, |ui| {
+                                ui.label("Player controls");
+                            });
+                        let content = egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for _ in 0..100 {
+                                    ui.label("History and resolver status");
+                                }
+                            });
+                        assert!(content.inner_rect.bottom() <= panel.response.rect.top());
+                        assert!(content.inner_rect.height() > 0.0);
+                    });
+                },
+            );
+        }
     }
 }

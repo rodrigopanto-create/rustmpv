@@ -19,7 +19,18 @@ class RunnerTests(unittest.TestCase):
         utils.DownloadError = type("DownloadError", (Exception,), {})
         spec = importlib.util.spec_from_file_location("yt_dlp_runner", RUNNER)
         self.runner = importlib.util.module_from_spec(spec)
-        with patch.dict(sys.modules, {"yt_dlp": dependency, "yt_dlp.utils": utils}):
+        provider = types.ModuleType("anonymous_provider")
+        provider.options = MagicMock(return_value={
+            "js_runtimes": {"node": {"path": "/native/libnode.so"}},
+            "extractor_args": {
+                "youtube": {"player_client": ["default"]},
+                "youtubepot-bgutilscript": {"server_home": ["/private/server"]},
+            },
+        })
+        self.provider = provider
+        with patch.dict(sys.modules, {
+            "yt_dlp": dependency, "yt_dlp.utils": utils, "anonymous_provider": provider,
+        }):
             spec.loader.exec_module(self.runner)
         self.factory = dependency.YoutubeDL
         self.download_error = utils.DownloadError
@@ -56,20 +67,295 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(options["extractor_retries"], 1)
                 self.assertFalse(options["noplaylist"])
                 self.assertEqual(options["playlistend"], 100)
+                self.assertEqual(options["extract_flat"], "in_playlist")
+                self.assertTrue(options["lazy_playlist"])
                 self.assertTrue(options["ignoreerrors"])
                 self.assertTrue(options["skip_download"])
-                self.assertEqual(options["js_runtimes"], {"quickjs": {"path": self.runtime_path}})
+                self.assertEqual(options["js_runtimes"], {
+                    "quickjs": {"path": self.runtime_path},
+                    "node": {"path": "/native/libnode.so"},
+                })
+                self.assertEqual(options["extractor_args"]["youtube"]["player_client"], ["default"])
+                self.assertEqual(options["extractor_args"]["youtubepot-bgutilscript"],
+                                 {"server_home": ["/private/server"]})
                 self.assertEqual(options["remote_components"], set())
                 self.assertIs(options["cachedir"], False)
                 self.assertIs(options["cachedir"], False)
                 self.downloader.extract_info.assert_called_with(
-                    "https://youtu.be/12345678901", download=False)
+                    "https://www.youtube.com/watch?v=12345678901", download=False)
 
     def test_requested_direct_stream(self):
         self.downloader.extract_info.return_value = {
             "requested_downloads": [{"url": "https://cdn.example/audio"}]}
         self.assertEqual(self.resolve("https://youtube.com/watch?v=12345678901", True),
                          "https://cdn.example/audio")
+
+    def test_all_sites_use_guest_downloader_without_account_credentials(self):
+        self.downloader.extract_info.return_value = {"url": "https://cdn.example/video"}
+        urls = [
+            "https://youtube.com/watch?v=12345678901",
+            "https://x.com/user/status/1",
+            "https://www.instagram.com/reel/abc/",
+            "https://www.facebook.com/user/videos/1/",
+            "https://public.example/video",
+        ]
+        for url in urls:
+            with self.subTest(url=url):
+                result = self.runner.extract_media(
+                    url,
+                    True,
+                    self.runtime_path,
+                )
+                self.assertEqual(json.loads(result)["url"], "https://cdn.example/video")
+                options = self.factory.call_args.args[0]
+                for credential in ("cookiefile", "cookiesfrombrowser", "username", "password"):
+                    self.assertNotIn(credential, options)
+                self.assertFalse(options["usenetrc"])
+        self.assertEqual(self.downloader.extract_info.call_count, len(urls))
+        self.assertEqual(self.factory.call_count, 1)
+        self.downloader.close.assert_not_called()
+
+    def test_saved_cookie_argument_is_not_accepted(self):
+        with self.assertRaises(TypeError):
+            self.runner.extract_media("https://youtu.be/12345678901", True, self.runtime_path,
+                                      cookie_file="/private/saved-cookies.txt")
+
+    def test_missing_provider_is_an_explicit_error(self):
+        self.provider.options.side_effect = RuntimeError("El proveedor PO local no esta inicializado")
+        with self.assertRaisesRegex(RuntimeError, "proveedor PO"):
+            self.resolve("https://youtu.be/12345678901", True)
+        self.factory.assert_not_called()
+
+    def fallback_bridge(self, cookie_file="/private/site-cookies.txt"):
+        bridge = MagicMock()
+        bridge.prepareAnonymousExtraction.return_value = ""
+        bridge.prepareSupportedSiteCookiesForFallback.return_value = cookie_file
+        return bridge
+
+    def fallback(self, bridge):
+        return self.runner.extract_media_with_fallback(
+            "https://youtu.be/12345678901", True, self.runtime_path, None, bridge)
+
+    def test_cancel_interrupts_a_stuck_extractor_and_allows_next_request(self):
+        bridge = self.fallback_bridge()
+        cancel = False
+        bridge.isMediaExtractionCancelled.side_effect = lambda generation: cancel
+
+        def stuck(*args, **kwargs):
+            nonlocal cancel
+            cancel = True
+            while True:
+                pass
+
+        self.downloader.extract_info.side_effect = stuck
+        previous = sys.gettrace()
+        with self.assertRaisesRegex(RuntimeError, "cancelada por el usuario"):
+            self.runner.extract_media_request(
+                "https://youtu.be/12345678901", True, self.runtime_path, None,
+                bridge, False, False, 1)
+        self.assertIs(sys.gettrace(), previous)
+        self.assertIsNone(self.runner._request)
+        bridge.prepareSupportedSiteCookiesForFallback.assert_not_called()
+        self.downloader.close.assert_called_once()
+        self.downloader.extract_info.side_effect = None
+        self.downloader.extract_info.return_value = {"url": "https://cdn.example/next"}
+        bridge.isMediaExtractionCancelled.side_effect = None
+        bridge.isMediaExtractionCancelled.return_value = False
+        result = self.runner.extract_media_request(
+            "https://youtu.be/abcdefghijk", True, self.runtime_path, None,
+            bridge, False, False, 2)
+        self.assertEqual(json.loads(result)["url"], "https://cdn.example/next")
+
+    def test_cancelled_account_extractor_still_closes_and_deletes_cookie_file(self):
+        bridge = self.fallback_bridge()
+        cancel = False
+        bridge.isMediaExtractionCancelled.side_effect = lambda generation: cancel
+
+        def stuck(*args, **kwargs):
+            nonlocal cancel
+            cancel = True
+            while True:
+                pass
+
+        self.downloader.extract_info.side_effect = stuck
+        with patch.object(self.runner.os, "remove") as remove:
+            with self.assertRaisesRegex(RuntimeError, "cancelada"):
+                self.runner.extract_media_request(
+                    "https://youtu.be/12345678901", True, self.runtime_path, None,
+                    bridge, True, True, 3)
+        self.downloader.close.assert_called_once()
+        remove.assert_called_once_with("/private/site-cookies.txt")
+
+    def test_progress_reports_stages_without_forwarding_sensitive_extractor_text(self):
+        bridge = self.fallback_bridge()
+        bridge.isMediaExtractionCancelled.return_value = False
+
+        def extract(*args, **kwargs):
+            self.runner._errors.debug("[youtube] Downloading player https://host/?secret=value")
+            self.runner._errors.warning("temporary error")
+            return {"url": "https://cdn.example/video"}
+
+        self.downloader.extract_info.side_effect = extract
+        self.runner.extract_media_request(
+            "https://youtu.be/12345678901", True, self.runtime_path, None,
+            bridge, False, False, 4)
+        messages = [call.args[1] for call in bridge.reportMediaExtractionProgress.call_args_list]
+        self.assertTrue(any("JavaScript" in message for message in messages))
+        self.assertTrue(any("sigue en curso" in message for message in messages))
+        self.assertIn("Enlace resuelto; cargando en el player.", messages)
+        self.assertFalse(any("secret" in message or "https://" in message for message in messages))
+
+    def test_final_resolution_failure_is_reported_before_returning_error(self):
+        bridge = self.fallback_bridge(cookie_file="")
+        bridge.isMediaExtractionCancelled.return_value = False
+        self.downloader.extract_info.return_value = None
+        with self.assertRaisesRegex(RuntimeError, "No hay cookies"):
+            self.runner.extract_media_request(
+                "https://youtu.be/12345678901", True, self.runtime_path, None,
+                bridge, False, False, 5)
+        bridge.reportMediaExtractionProgress.assert_called_with(
+            5, "No se pudo resolver el enlace. El proceso ha terminado.")
+
+    def test_successful_guest_never_reads_cookies(self):
+        bridge = self.fallback_bridge()
+        self.downloader.extract_info.return_value = {"url": "https://cdn.example/public"}
+        self.assertEqual(json.loads(self.fallback(bridge))["url"], "https://cdn.example/public")
+        bridge.prepareSupportedSiteCookiesForFallback.assert_not_called()
+        bridge.setSupportedSiteCookiesFallbackStatus.assert_not_called()
+        self.downloader.close.assert_not_called()
+
+    def test_guest_failure_retries_once_with_isolated_account_downloader(self):
+        bridge = self.fallback_bridge()
+        authenticated = MagicMock()
+        self.factory.side_effect = [self.downloader, authenticated]
+        self.downloader.extract_info.side_effect = self.download_error("login required")
+        authenticated.extract_info.return_value = {"url": "https://cdn.example/account"}
+        with patch.object(self.runner.os, "remove") as remove:
+            self.assertEqual(json.loads(self.fallback(bridge))["url"], "https://cdn.example/account")
+        self.assertEqual(self.factory.call_count, 2)
+        guest_options, account_options = [call.args[0] for call in self.factory.call_args_list]
+        self.assertNotIn("cookiefile", guest_options)
+        self.assertEqual(account_options["cookiefile"], "/private/site-cookies.txt")
+        self.assertNotIn("extractor_args", account_options)
+        bridge.setSupportedSiteCookiesFallbackStatus.assert_called_once_with("fallback")
+        authenticated.extract_info.assert_called_once()
+        authenticated.close.assert_called_once()
+        self.downloader.close.assert_not_called()
+        remove.assert_called_once_with("/private/site-cookies.txt")
+        self.assertEqual(list(self.runner._downloaders.values()), [self.downloader])
+
+    def test_both_failures_are_reported_and_cookie_file_is_cleaned(self):
+        bridge = self.fallback_bridge()
+        self.downloader.extract_info.side_effect = [
+            self.download_error("guest blocked"), self.download_error("cookies expired")]
+        with patch.object(self.runner.os, "remove") as remove:
+            with self.assertRaisesRegex(RuntimeError, "anonimo: guest blocked.*cookies: cookies expired"):
+                self.fallback(bridge)
+        self.assertEqual(self.downloader.extract_info.call_count, 2)
+        self.downloader.close.assert_called_once()
+        remove.assert_called_once()
+
+    def test_empty_extractor_result_triggers_cookie_fallback(self):
+        bridge = self.fallback_bridge()
+        self.downloader.extract_info.side_effect = [None, {"url": "https://cdn.example/account"}]
+        with patch.object(self.runner.os, "remove"):
+            self.assertEqual(json.loads(self.fallback(bridge))["url"], "https://cdn.example/account")
+        bridge.prepareSupportedSiteCookiesForFallback.assert_called_once()
+
+    def test_no_matching_cookies_reports_guest_failure_without_second_attempt(self):
+        bridge = self.fallback_bridge("")
+        self.downloader.extract_info.side_effect = self.download_error("guest blocked")
+        with self.assertRaisesRegex(RuntimeError, "guest blocked.*No hay cookies"):
+            self.fallback(bridge)
+        self.assertEqual(self.factory.call_count, 1)
+        bridge.setSupportedSiteCookiesFallbackStatus.assert_not_called()
+
+    def test_provider_initialization_failure_still_allows_account_fallback(self):
+        bridge = self.fallback_bridge()
+        bridge.prepareAnonymousExtraction.return_value = "Provider unavailable"
+        self.provider.options.side_effect = RuntimeError("Provider unavailable")
+        self.downloader.extract_info.return_value = {"url": "https://cdn.example/account"}
+        with patch.object(self.runner.os, "remove"):
+            self.assertEqual(json.loads(self.fallback(bridge))["url"], "https://cdn.example/account")
+        self.provider.options.assert_not_called()
+        self.assertEqual(self.factory.call_count, 1)
+        self.downloader.close.assert_called_once()
+        self.assertEqual(self.runner._downloaders, {})
+
+    def test_programming_error_does_not_use_account_credentials(self):
+        bridge = self.fallback_bridge()
+        self.downloader.extract_info.side_effect = TypeError("bug")
+        with self.assertRaisesRegex(TypeError, "bug"):
+            self.fallback(bridge)
+        bridge.prepareSupportedSiteCookiesForFallback.assert_not_called()
+
+    def test_account_constructor_failure_still_removes_decrypted_cookies(self):
+        bridge = self.fallback_bridge()
+        bridge.prepareAnonymousExtraction.return_value = "Provider unavailable"
+        self.factory.side_effect = RuntimeError("constructor failed")
+        with patch.object(self.runner.os, "remove") as remove:
+            with self.assertRaisesRegex(RuntimeError, "constructor failed"):
+                self.fallback(bridge)
+        remove.assert_called_once()
+
+    def test_invalid_input_never_attempts_provider_or_cookies(self):
+        bridge = self.fallback_bridge()
+        with self.assertRaises(RuntimeError):
+            self.runner.extract_media_with_fallback(
+                "file:///private/video", True, self.runtime_path, None, bridge)
+        bridge.prepareAnonymousExtraction.assert_not_called()
+        bridge.prepareSupportedSiteCookiesForFallback.assert_not_called()
+
+    def test_temporary_cookie_cleanup_failure_is_not_hidden(self):
+        bridge = self.fallback_bridge()
+        bridge.prepareAnonymousExtraction.return_value = "Provider unavailable"
+        self.downloader.extract_info.return_value = {"url": "https://cdn.example/account"}
+        with patch.object(self.runner.os, "remove", side_effect=OSError("denied")):
+            with self.assertRaisesRegex(RuntimeError, "archivo temporal"):
+                self.fallback(bridge)
+        self.downloader.close.assert_called_once()
+
+    def test_playback_cookie_retry_skips_guest_and_reports_account_provenance(self):
+        bridge = self.fallback_bridge()
+        self.downloader.extract_info.return_value = {"url": "https://cdn.example/account", "id": "a"}
+        with patch.object(self.runner.os, "remove") as remove:
+            media = json.loads(self.runner.extract_media_with_fallback(
+                "https://youtu.be/12345678901", True, self.runtime_path, None, bridge,
+                cookies_only=True, refresh=True,
+            ))
+        bridge.prepareAnonymousExtraction.assert_not_called()
+        self.assertTrue(media["used_cookies"])
+        self.assertEqual(media["entry_id"], "a")
+        self.assertEqual(self.factory.call_count, 1)
+        self.assertEqual(self.runner._downloaders, {})
+        remove.assert_called_once()
+
+    def test_playback_refresh_discards_old_guest_before_resolving_again(self):
+        bridge = self.fallback_bridge()
+        self.downloader.extract_info.return_value = {"url": "https://cdn.example/old"}
+        self.fallback(bridge)
+        fresh = MagicMock()
+        fresh.extract_info.return_value = {"url": "https://cdn.example/new"}
+        self.factory.return_value = fresh
+        media = json.loads(self.runner.extract_media_with_fallback(
+            "https://youtu.be/12345678901", True, self.runtime_path, None, bridge, refresh=True,
+        ))
+        self.assertEqual(media["url"], "https://cdn.example/new")
+        self.assertFalse(media.get("used_cookies", False))
+        self.downloader.close.assert_called_once()
+        bridge.prepareSupportedSiteCookiesForFallback.assert_not_called()
+
+    def test_playlist_identity_tracks_successful_entries_without_stream_url_tokens(self):
+        self.downloader.extract_info.return_value = {
+            "_type": "playlist",
+            "entries": [
+                {"id": "a", "url": "https://cdn.example/a?signature=secret"},
+                None,
+                {"id": "b", "url": "https://cdn.example/b?signature=secret"},
+            ],
+        }
+        media = self.media("https://youtube.com/playlist?list=PL123", True)
+        self.assertEqual(media["entry_ids"], ["a", "b"])
 
     def test_playlist_returns_bounded_stream_queue(self):
         self.downloader.extract_info.return_value = {
@@ -86,6 +372,293 @@ class RunnerTests(unittest.TestCase):
             ["https://cdn.example/1", "https://cdn.example/2"],
         )
         self.assertEqual(self.downloader.extract_info.call_count, 1)
+
+    def test_youtube_shared_links_preserve_playlist_and_music_context(self):
+        cases = [
+            ("https://youtu.be/abcdefghijk?list=RDMM&index=4",
+             "https://www.youtube.com/watch?v=abcdefghijk&list=RDMM&index=4"),
+            ("https://music.youtube.com/shorts/abcdefghijk?list=RDAMVMabcdefghijk",
+             "https://music.youtube.com/watch?v=abcdefghijk&list=RDAMVMabcdefghijk"),
+            ("https://www.youtube.com/embed/videoseries?list=PL123",
+             "https://www.youtube.com/playlist?list=PL123"),
+            ("https://youtube.com/live/abcdefghijk?list=PL123",
+             "https://www.youtube.com/watch?v=abcdefghijk&list=PL123"),
+            ("https://youtube.com/attribution_link?u=%2Fwatch%3Fv%3Dabcdefghijk%26list%3DPL123",
+             "https://www.youtube.com/watch?v=abcdefghijk&list=PL123"),
+            ("https://music.youtube.com/browse/MPREb123",
+             "https://music.youtube.com/browse/MPREb123"),
+            ("https://music.youtube.com/browse/VLPL123",
+             "https://music.youtube.com/browse/VLPL123"),
+        ]
+        self.downloader.extract_info.return_value = {"url": "https://cdn.example/a"}
+        for original, normalized in cases:
+            with self.subTest(original=original):
+                self.media(original, True)
+                self.downloader.extract_info.assert_called_with(normalized, download=False)
+        with self.assertRaisesRegex(RuntimeError, "no apunta a YouTube"):
+            self.media("https://youtube.com/redirect?q=https://other.example/", True)
+
+    def test_seeded_radio_playlist_uses_watch_route_without_losing_context(self):
+        for prefix in ("RD", "RDAMVM"):
+            original = (
+                f"https://music.youtube.com/playlist?list={prefix}UsR08cY8k0A"
+                "&playnext=1&index=3&si=shared")
+            self.assertEqual(self.runner._normalize_youtube_url(original), (
+                f"https://music.youtube.com/watch?v=UsR08cY8k0A&list={prefix}UsR08cY8k0A"
+                "&playnext=1&index=3&si=shared"))
+        for list_id in ("RDMM", "RDTMAK123", "RDCLAK123", "RDabcdefghij!", "PLUsR08cY8k0A"):
+            url = f"https://youtube.com/playlist?list={list_id}"
+            self.assertEqual(self.runner._normalize_youtube_url(url), url)
+
+    def test_personal_playlist_uses_account_from_start_without_guest_provider(self):
+        bridge = self.fallback_bridge()
+        self.downloader.extract_info.return_value = {
+            "_type": "playlist",
+            "entries": [{"id": "abcdefghijk", "url": "https://cdn.example/account"}],
+        }
+        with patch.object(self.runner.os, "remove") as remove:
+            media = json.loads(self.runner.extract_media_with_fallback(
+                "https://music.youtube.com/watch?v=abcdefghijk&list=RDMM",
+                True, self.runtime_path, None, bridge, cookies_only=True))
+        bridge.prepareAnonymousExtraction.assert_not_called()
+        bridge.setSupportedSiteCookiesFallbackStatus.assert_called_once_with("session")
+        self.assertTrue(media["used_cookies"])
+        self.assertIn("1 reproducibles", media["playlist_notice"])
+        self.assertEqual(self.factory.call_args.args[0]["cookiefile"], "/private/site-cookies.txt")
+        self.downloader.close.assert_called_once()
+        remove.assert_called_once()
+
+    def test_personal_playlist_without_cookies_never_substitutes_anonymous_mix(self):
+        bridge = self.fallback_bridge("")
+        with self.assertRaisesRegex(RuntimeError, "No se sustituye una lista personal"):
+            self.runner.extract_media_with_fallback(
+                "https://music.youtube.com/playlist?list=RDMM",
+                True, self.runtime_path, None, bridge, cookies_only=True)
+        bridge.prepareAnonymousExtraction.assert_not_called()
+        self.factory.assert_not_called()
+
+    def test_personal_playlist_rejects_cookie_jar_without_youtube_authentication(self):
+        bridge = self.fallback_bridge()
+        self.downloader.get_info_extractor.return_value.is_authenticated = False
+        self.downloader.extract_info.return_value = {"url": "https://cdn.example/guest"}
+        with patch.object(self.runner.os, "remove") as remove:
+            with self.assertRaisesRegex(RuntimeError, "sesion de YouTube"):
+                self.runner.extract_media_with_fallback(
+                    "https://music.youtube.com/playlist?list=RDMM",
+                    True, self.runtime_path, None, bridge, cookies_only=True)
+        self.downloader.extract_info.assert_not_called()
+        bridge.prepareAnonymousExtraction.assert_not_called()
+        self.downloader.close.assert_called_once()
+        remove.assert_called_once()
+
+    def test_personal_playlist_rejects_session_lost_during_extraction(self):
+        bridge = self.fallback_bridge()
+        extractor = self.downloader.get_info_extractor.return_value
+        extractor.is_authenticated = True
+
+        def expired(*_args, **_kwargs):
+            extractor.is_authenticated = False
+            return {"url": "https://cdn.example/guest"}
+
+        self.downloader.extract_info.side_effect = expired
+        with patch.object(self.runner.os, "remove") as remove:
+            with self.assertRaisesRegex(RuntimeError, "sesion de YouTube"):
+                self.runner.extract_media_with_fallback(
+                    "https://music.youtube.com/playlist?list=RDMM",
+                    True, self.runtime_path, None, bridge, cookies_only=True)
+        bridge.prepareAnonymousExtraction.assert_not_called()
+        self.downloader.close.assert_called_once()
+        remove.assert_called_once()
+
+    def test_personal_playlist_rejects_rotated_cookie_warning_even_with_auth_cookies(self):
+        bridge = self.fallback_bridge()
+        self.downloader.get_info_extractor.return_value.is_authenticated = True
+
+        def rotated(*_args, **_kwargs):
+            self.runner._errors.warning(
+                "[youtube:tab] The provided YouTube account cookies are no longer valid. "
+                "They have likely been rotated in the browser as a security measure.")
+            return {"url": "https://cdn.example/guest"}
+
+        self.downloader.extract_info.side_effect = rotated
+        with patch.object(self.runner.os, "remove") as remove:
+            with self.assertRaisesRegex(RuntimeError, "sesion de YouTube"):
+                self.runner.extract_media_with_fallback(
+                    "https://music.youtube.com/playlist?list=RDMM",
+                    True, self.runtime_path, None, bridge, cookies_only=True)
+        bridge.prepareAnonymousExtraction.assert_not_called()
+        self.downloader.close.assert_called_once()
+        remove.assert_called_once()
+
+    def test_personal_playlist_failure_does_not_fall_back_to_guest(self):
+        bridge = self.fallback_bridge()
+        self.downloader.extract_info.side_effect = self.download_error("expired session")
+        with patch.object(self.runner.os, "remove") as remove:
+            with self.assertRaisesRegex(self.download_error, "expired session"):
+                self.runner.extract_media_with_fallback(
+                    "https://music.youtube.com/playlist?list=RDMM",
+                    True, self.runtime_path, None, bridge, cookies_only=True)
+        bridge.prepareAnonymousExtraction.assert_not_called()
+        self.factory.assert_called_once()
+        self.downloader.close.assert_called_once()
+        remove.assert_called_once()
+
+    def test_flat_radio_entry_is_resolved_without_recursing_into_its_playlist(self):
+        self.downloader.extract_info.side_effect = [
+            {"_type": "playlist", "entries": [
+                {"_type": "url", "id": "abcdefghijk", "ie_key": "Youtube",
+                 "url": "https://music.youtube.com/watch?v=abcdefghijk&list=RDMM"},
+            ]},
+            {"id": "abcdefghijk", "url": "https://cdn.example/a"},
+        ]
+        self.media("https://music.youtube.com/playlist?list=RDMM", True)
+        self.downloader.extract_info.assert_called_with(
+            "https://www.youtube.com/watch?v=abcdefghijk", download=False)
+
+    def test_request_publishes_first_track_before_resolving_second_and_marks_final_complete(self):
+        bridge = self.fallback_bridge()
+        bridge.isMediaExtractionCancelled.return_value = False
+        emitted = []
+        bridge.reportMediaExtractionItem.side_effect = (
+            lambda generation, payload: emitted.append((generation, json.loads(payload))))
+
+        def extract(url, **_kwargs):
+            if "list=" in url:
+                return {"_type": "playlist", "entries": [
+                    {"_type": "url", "id": "abcdefghijk"},
+                    {"_type": "url", "id": "lmnopqrstuv"},
+                ]}
+            if "lmnopqrstuv" in url:
+                self.assertEqual(len(emitted), 1)
+                self.assertEqual(emitted[0][1]["url"], "https://cdn.example/abcdefghijk")
+            return {"id": url.split("v=")[1], "url": "https://cdn.example/" + url.split("v=")[1]}
+
+        self.downloader.extract_info.side_effect = extract
+        final = json.loads(self.runner.extract_media_request(
+            "https://music.youtube.com/playlist?list=PL123", True,
+            self.runtime_path, None, bridge, False, False, 42))
+        self.assertEqual([generation for generation, _ in emitted], [42, 42])
+        self.assertTrue(all(media["playlist_pending"] for _, media in emitted))
+        self.assertEqual(len(emitted[-1][1]["playlist"]), 1)
+        self.assertFalse(final.get("playlist_pending", False))
+        self.assertEqual(final["entry_ids"], ["abcdefghijk", "lmnopqrstuv"])
+        self.assertFalse(self.runner._streaming)
+
+    def test_partial_guest_queue_never_switches_to_account_after_publication_error(self):
+        bridge = self.fallback_bridge()
+        bridge.isMediaExtractionCancelled.return_value = False
+        bridge.reportMediaExtractionItem.side_effect = [None, RuntimeError("queue transport failed")]
+        self.downloader.extract_info.return_value = {"_type": "playlist", "entries": [
+            {"id": "a", "url": "https://cdn.example/a"},
+            {"id": "b", "url": "https://cdn.example/b"},
+        ]}
+        with self.assertRaisesRegex(RuntimeError, "No se cambia de sesion"):
+            self.runner.extract_media_request(
+                "https://youtube.com/playlist?list=PL123", True,
+                self.runtime_path, None, bridge, False, False, 42)
+        bridge.prepareSupportedSiteCookiesForFallback.assert_not_called()
+
+    def test_account_queue_checks_authentication_before_each_published_track(self):
+        bridge = self.fallback_bridge()
+        bridge.isMediaExtractionCancelled.return_value = False
+        extractor = self.downloader.get_info_extractor.return_value
+        extractor.is_authenticated = True
+        emitted = []
+
+        def publish(_generation, payload):
+            emitted.append(json.loads(payload))
+            extractor.is_authenticated = False
+
+        bridge.reportMediaExtractionItem.side_effect = publish
+        self.downloader.extract_info.return_value = {"_type": "playlist", "entries": [
+            {"id": "a", "url": "https://cdn.example/a"},
+            {"id": "b", "url": "https://cdn.example/b"},
+        ]}
+        with patch.object(self.runner.os, "remove") as remove:
+            with self.assertRaisesRegex(RuntimeError, "sesion de YouTube"):
+                self.runner.extract_media_request(
+                    "https://music.youtube.com/playlist?list=RDMM", True,
+                    self.runtime_path, None, bridge, True, False, 42)
+        self.assertEqual(len(emitted), 1)
+        self.assertTrue(emitted[0]["used_cookies"])
+        bridge.prepareAnonymousExtraction.assert_not_called()
+        remove.assert_called_once()
+        self.assertIsNone(self.runner._account_downloader)
+
+    def test_expired_account_is_rejected_before_enumerating_or_resolving_tracks(self):
+        bridge = self.fallback_bridge()
+        bridge.isMediaExtractionCancelled.return_value = False
+        self.downloader.get_info_extractor.return_value.is_authenticated = True
+
+        def entries():
+            raise AssertionError("Invalid account must fail before enumerating its radio")
+            yield
+
+        def expired(*_args, **_kwargs):
+            self.runner._errors.warning(
+                "The provided YouTube account cookies are no longer valid.")
+            return {"_type": "playlist", "entries": entries()}
+
+        self.downloader.extract_info.side_effect = expired
+        with patch.object(self.runner.os, "remove") as remove:
+            with self.assertRaisesRegex(RuntimeError, "sesion de YouTube"):
+                self.runner.extract_media_request(
+                    "https://youtube.com/playlist?list=RDUsR08cY8k0A", True,
+                    self.runtime_path, None, bridge, True, False, 42)
+        self.assertEqual(self.downloader.extract_info.call_count, 1)
+        bridge.reportMediaExtractionItem.assert_not_called()
+        bridge.prepareAnonymousExtraction.assert_not_called()
+        remove.assert_called_once()
+
+    def test_playback_recovery_remains_atomic_without_partial_publication(self):
+        bridge = self.fallback_bridge()
+        bridge.isMediaExtractionCancelled.return_value = False
+        self.downloader.extract_info.return_value = {"_type": "playlist", "entries": [
+            {"id": "a", "url": "https://cdn.example/a"},
+            {"id": "b", "url": "https://cdn.example/b"},
+        ]}
+        result = json.loads(self.runner.extract_media_request(
+            "https://youtube.com/playlist?list=PL123", True,
+            self.runtime_path, None, bridge, False, True, 42))
+        bridge.reportMediaExtractionItem.assert_not_called()
+        self.assertEqual(len(result["playlist"]), 1)
+
+    def test_cancel_during_playlist_discards_the_guest_before_the_next_url(self):
+        bridge = self.fallback_bridge()
+        bridge.isMediaExtractionCancelled.return_value = False
+        bridge.reportMediaExtractionItem.side_effect = [None, self.runner.ExtractionCancelled()]
+        self.downloader.extract_info.return_value = {"_type": "playlist", "entries": [
+            {"id": "a", "url": "https://cdn.example/a"},
+            {"id": "b", "url": "https://cdn.example/b"},
+        ]}
+        with self.assertRaisesRegex(RuntimeError, "cancelada"):
+            self.runner.extract_media_request(
+                "https://youtube.com/playlist?list=PL123", True,
+                self.runtime_path, None, bridge, False, False, 42)
+        self.assertEqual(self.runner._downloaders, {})
+        self.downloader.close.assert_called_once()
+        fresh = MagicMock()
+        fresh.extract_info.return_value = {"url": "https://cdn.example/next"}
+        self.factory.return_value = fresh
+        self.assertEqual(self.media("https://youtu.be/abcdefghijk", True)["url"],
+                         "https://cdn.example/next")
+
+    def test_unbounded_mix_is_only_consumed_up_to_100_entries(self):
+        consumed = []
+
+        def entries():
+            for index in range(100):
+                consumed.append(index)
+                yield {"id": str(index), "url": f"https://cdn.example/{index}"}
+            raise AssertionError("Must not enumerate an endless mix beyond the limit")
+
+        self.downloader.extract_info.return_value = {"_type": "playlist", "entries": entries()}
+        media = self.media("https://music.youtube.com/playlist?list=RDMM", True)
+        self.assertEqual(len(consumed), 100)
+        self.assertEqual(len(media["playlist"]), 99)
+        self.assertEqual(len(media["entry_ids"]), 100)
+        self.assertIn("100 reproducibles", media["playlist_notice"])
+        self.assertIn("Limite: 100", media["playlist_notice"])
 
     def test_playlist_skips_unavailable_entries(self):
         self.downloader.extract_info.return_value = {

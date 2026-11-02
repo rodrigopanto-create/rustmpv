@@ -13,6 +13,7 @@ android {
         targetSdk 36
         versionCode 1
         versionName "0.1.0"
+        testInstrumentationRunner "com.visualrustmpv.app.PlaybackRecoveryInstrumentation"
 
         ndk {
             abiFilters "arm64-v8a"
@@ -41,6 +42,7 @@ android {
     sourceSets {
         main {
             assets.srcDir layout.buildDirectory.dir("generated/quickjsAssets")
+            assets.srcDir layout.buildDirectory.dir("generated/anonymousProviderAssets")
             jniLibs.srcDirs = [
                 "src/main/jniLibs",
                 "../../assets/android"
@@ -86,4 +88,17 @@ tasks.register("verifyQuickJs") {
 }
 tasks.named("preBuild").configure {
     dependsOn("verifyQuickJs")
+    dependsOn("verifyAnonymousProvider")
+}
+
+tasks.register("verifyAnonymousProvider") {
+    doLast {
+        def runtime = file("src/main/jniLibs/arm64-v8a/libnode.so")
+        def assets = layout.buildDirectory.dir("generated/anonymousProviderAssets").get().asFile
+        if (!runtime.isFile() || !new File(assets, "anonymous-provider.zip").isFile()
+                || !new File(assets, "licenses/bgutil-GPL-3.0.txt").isFile()
+                || !new File(assets, "sources/bgutil-2.0.2.zip").isFile()) {
+            throw new GradleException("Falta Node.js/bgutil o sus fuentes/licencias. Ejecuta build-android-chaquopy.ps1.")
+        }
+    }
 }

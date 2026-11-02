@@ -29,6 +29,10 @@ pub struct Entry {
 
 impl Entry {
     pub fn resume_position(&self) -> Option<f64> {
+        // A queue position belongs to an item, not the first track of a new mix.
+        if crate::youtube::collection(&self.input) {
+            return None;
+        }
         let duration = self
             .duration
             .filter(|value| value.is_finite() && *value > 0.0)?;
@@ -56,6 +60,9 @@ impl Entry {
 /// Un mismo video de YouTube comparte posicion aunque cambie el formato del enlace.
 pub fn key(input: &str) -> String {
     let input = input.trim();
+    if let Some(id) = crate::youtube::playlist_id(input) {
+        return format!("youtube:playlist:{id}");
+    }
     youtube_id(input)
         .map(|id| format!("youtube:{id}"))
         .unwrap_or_else(|| input.to_owned())
@@ -356,12 +363,13 @@ mod tests {
             "https://www.youtube.com/watch?v=jNQXAC9IVRw&t=4",
             "https://youtu.be/jNQXAC9IVRw?si=abc",
             "https://m.youtube.com/watch?v=jNQXAC9IVRw",
-            "https://music.youtube.com/watch?v=jNQXAC9IVRw&list=x",
+            "https://music.youtube.com/watch?v=jNQXAC9IVRw",
             "https://youtube.com/shorts/jNQXAC9IVRw",
             " https://www.youtube.com/live/jNQXAC9IVRw ",
         ] {
             assert_eq!(key(input), expected, "{input}");
         }
+
         assert_eq!(
             key(" https://cdn.example/a.mp3 "),
             "https://cdn.example/a.mp3"
@@ -374,6 +382,20 @@ mod tests {
             key("https://evil.example/watch?v=jNQXAC9IVRw"),
             "https://evil.example/watch?v=jNQXAC9IVRw"
         );
+    }
+
+    #[test]
+    fn playlists_do_not_collide_with_individual_video_history_or_resume_wrong_track() {
+        let playlist = "https://music.youtube.com/watch?v=jNQXAC9IVRw&list=RDMM";
+        assert_eq!(
+            key(playlist),
+            key("https://www.youtube.com/playlist?list=RDMM")
+        );
+        assert_ne!(key(playlist), key("https://youtu.be/jNQXAC9IVRw"));
+        let mut item = entry(playlist);
+        item.position = 45.0;
+        item.duration = Some(180.0);
+        assert_eq!(item.resume_position(), None);
     }
 
     #[test]

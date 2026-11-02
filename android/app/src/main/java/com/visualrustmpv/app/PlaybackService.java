@@ -314,7 +314,7 @@ public final class PlaybackService extends Service {
             reportError("No se obtuvo el foco de audio; reproduccion pausada");
             return;
         }
-        if (active && !paused) {
+        if (active && (!paused || (flags & 32) != 0)) {
             if (!wakeLock.isHeld()) wakeLock.acquire();
         } else {
             if (wakeLock.isHeld()) wakeLock.release();
@@ -364,7 +364,8 @@ public final class PlaybackService extends Service {
         boolean paused = (flags & 2) != 0;
         Notification.Builder builder = Build.VERSION.SDK_INT >= 26
                 ? new Notification.Builder(this, CHANNEL) : new Notification.Builder(this);
-        String state = paused ? "En pausa" : "Reproduciendo";
+        String state = (flags & 32) != 0 ? "Renovando enlace..."
+                : paused ? "En pausa" : (flags & 4) == 0 ? "Cargando..." : "Reproduciendo";
         return builder.setContentTitle(title)
                 .setContentText(artist.isEmpty() ? state : artist)
                 .setSubText(state)
@@ -399,7 +400,7 @@ public final class PlaybackService extends Service {
         handler.removeCallbacks(ticker);
         artworkGeneration++;
         artworkLoader.shutdownNow();
-        if (nativeTick() != 0) nativeControl(2);
+        if ((nativeTick() & 1) != 0) nativeControl(2);
         if (wakeLock.isHeld()) wakeLock.release();
         resumeOnFocus = false;
         releaseFocus();

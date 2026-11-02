@@ -11,6 +11,10 @@ pub struct MediaInfo {
     pub artist: String,
     pub thumbnails: Vec<String>,
     pub playlist: Vec<String>,
+    pub used_cookies: bool,
+    pub entry_ids: Vec<String>,
+    pub playlist_notice: String,
+    pub playlist_pending: bool,
 }
 
 #[cfg(any(feature = "chaquopy", test))]
@@ -25,6 +29,16 @@ struct RawMedia {
     thumbnails: Vec<String>,
     #[serde(default)]
     playlist: Vec<String>,
+    #[serde(default)]
+    used_cookies: bool,
+    #[serde(default)]
+    entry_id: String,
+    #[serde(default)]
+    entry_ids: Vec<String>,
+    #[serde(default)]
+    playlist_notice: String,
+    #[serde(default)]
+    playlist_pending: bool,
 }
 
 impl MediaInfo {
@@ -68,6 +82,10 @@ impl MediaInfo {
             artist: clean_text(&host),
             thumbnails: Vec::new(),
             playlist: Vec::new(),
+            used_cookies: false,
+            entry_ids: Vec::new(),
+            playlist_notice: String::new(),
+            playlist_pending: false,
         }
     }
 
@@ -81,6 +99,14 @@ impl MediaInfo {
                 "La lista supera el limite de {} elementos",
                 PLAYLIST_LIMIT
             ));
+        }
+        let entry_ids = if raw.entry_ids.is_empty() && raw.playlist.is_empty() {
+            vec![raw.entry_id]
+        } else {
+            raw.entry_ids
+        };
+        if !entry_ids.is_empty() && entry_ids.len() != raw.playlist.len() + 1 {
+            return Err("Identificadores de lista no corresponden a sus streams".to_owned());
         }
         let playlist = raw
             .playlist
@@ -100,6 +126,10 @@ impl MediaInfo {
             artist: clean_text(&raw.artist),
             thumbnails,
             playlist,
+            used_cookies: raw.used_cookies,
+            entry_ids,
+            playlist_notice: clean_text(&raw.playlist_notice),
+            playlist_pending: raw.playlist_pending,
         })
     }
 }
@@ -292,5 +322,23 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn validates_recovery_identity_and_account_provenance() {
+        let media = MediaInfo::from_json(
+            r#"{"url":"https://cdn.example/a","used_cookies":true,
+                "playlist":["https://cdn.example/b"],"entry_ids":["a","b"]}"#,
+        )
+        .unwrap();
+        assert!(media.used_cookies);
+        assert_eq!(media.entry_ids, vec!["a", "b"]);
+        let media =
+            MediaInfo::from_json(r#"{"url":"https://cdn.example/a","entry_id":"a"}"#).unwrap();
+        assert!(!media.used_cookies);
+        assert_eq!(media.entry_ids, vec!["a"]);
+        assert!(MediaInfo::from_json(
+            r#"{"url":"https://cdn.example/a","playlist":["https://cdn.example/b"],"entry_ids":["a"]}"#,
+        ).is_err());
     }
 }

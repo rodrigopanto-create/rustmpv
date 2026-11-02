@@ -12,11 +12,30 @@ pub struct Playback {
     pub ended: bool,
     pub stopped: bool,
     pub diagnostic: Option<String>,
+    pub stream_failure: bool,
+    pub playlist_position: usize,
+    pub last_position: Option<f64>,
+    pub cancel_generation: u64,
+    pub recovering: bool,
+    pub load_generation: u64,
     #[cfg(target_os = "android")]
     last_logged_position: Option<f64>,
 }
 
 impl Playback {
+    pub fn service_flags(&self) -> i64 {
+        if self.recovering {
+            // Renewal is buffering, not a terminal error or a stopped service.
+            1 | (i64::from(self.paused) << 1) | 8 | 32
+        } else {
+            i64::from(self.active)
+                | (i64::from(self.paused) << 1)
+                | (i64::from(self.loaded) << 2)
+                | (i64::from(self.buffering) << 3)
+                | (i64::from(self.error.is_some()) << 4)
+        }
+    }
+
     pub fn is_playing(&self) -> bool {
         self.active
             && self.loaded
@@ -33,6 +52,8 @@ impl Playback {
             // mpv only re-emits observed properties when their values change.
             paused: self.paused,
             audio_output: self.audio_output.take(),
+            cancel_generation: self.cancel_generation,
+            load_generation: self.load_generation.wrapping_add(1),
             ..Self::default()
         };
     }
@@ -64,6 +85,7 @@ impl Playback {
 
     pub fn fail(&mut self, message: String) {
         self.active = false;
+        self.stream_failure = false;
         self.error = Some(message);
     }
 
@@ -76,40 +98,56 @@ impl Playback {
         self.error = None;
         self.position = None;
         self.duration = None;
+        self.stream_failure = false;
+        self.recovering = false;
+    }
+
+    pub fn cancel(&mut self) {
+        self.cancel_generation = self.cancel_generation.wrapping_add(1);
+        self.stop();
     }
 
     fn record_error(&mut self, message: &str) {
         let lower = message.to_ascii_lowercase();
-        let detail = if lower.contains("certificate") || lower.contains("tls") {
-            Some("Fallo al verificar el certificado TLS")
-        } else if lower.contains("403") {
-            Some("El servidor rechazo el stream (HTTP 403)")
-        } else if lower.contains("404") {
-            Some("El stream no existe (HTTP 404)")
-        } else if lower.contains("timed out") || lower.contains("timeout") {
-            Some("Se agoto el tiempo de conexion")
-        } else if lower.contains("connection refused")
-            || lower.contains("couldn't connect")
-            || lower.contains("could not connect")
-        {
-            Some("No se pudo conectar al servidor")
-        } else if lower.contains("resolve host") || lower.contains("name resolution") {
-            Some("No se pudo resolver el nombre del servidor")
-        } else if lower.contains("audio output") && lower.contains("failed") {
-            Some("No se pudo iniciar la salida de audio")
-        } else {
-            None
-        };
+        let detail =
+            if lower.contains("certificate") || lower.contains("tls") || lower.contains("ssl") {
+                Some("Fallo al verificar el certificado TLS")
+            } else if lower.contains("401") || lower.contains("403") {
+                Some("El servidor rechazo el stream (HTTP 403)")
+            } else if lower.contains("404") || lower.contains("410") {
+                Some("El stream no existe (HTTP 404)")
+            } else if lower.contains("timed out") || lower.contains("timeout") {
+                Some("Se agoto el tiempo de conexion")
+            } else if lower.contains("connection refused")
+                || lower.contains("couldn't connect")
+                || lower.contains("could not connect")
+            {
+                Some("No se pudo conectar al servidor")
+            } else if lower.contains("resolve host") || lower.contains("name resolution") {
+                Some("No se pudo resolver el nombre del servidor")
+            } else if lower.contains("audio output") && lower.contains("failed") {
+                Some("No se pudo iniciar la salida de audio")
+            } else {
+                None
+            };
         if let Some(detail) = detail {
             self.diagnostic = Some(detail.to_owned());
         }
+    }
+
+    pub fn fail_stream(&mut self, message: String) {
+        self.fail(message);
+        self.stream_failure = !self
+            .diagnostic
+            .as_deref()
+            .is_some_and(|detail| detail.contains("TLS") || detail.contains("audio"));
     }
 }
 
 #[cfg(target_os = "android")]
 mod native {
     use super::Playback;
-    use std::ffi::{CStr, c_char, c_int, c_void};
+    use std::ffi::{CStr, CString, c_char, c_int, c_void};
 
     #[repr(C)]
     struct Event {
@@ -150,6 +188,12 @@ mod native {
         ) -> c_int;
         fn mpv_request_log_messages(context: *mut c_void, level: *const c_char) -> c_int;
         fn mpv_error_string(error: c_int) -> *const c_char;
+        fn mpv_get_property(
+            context: *mut c_void,
+            name: *const c_char,
+            format: c_int,
+            data: *mut c_void,
+        ) -> c_int;
     }
 
     pub fn error_text(code: c_int) -> String {
@@ -189,9 +233,39 @@ mod native {
         Ok(())
     }
 
+    fn failed_playlist_index(context: usize, entry: i64) -> Result<usize, String> {
+        let context = context as *mut c_void;
+        let mut count: i64 = 0;
+        let result = unsafe {
+            mpv_get_property(
+                context,
+                c"playlist/count".as_ptr(),
+                4,
+                (&mut count as *mut i64).cast(),
+            )
+        };
+        if result < 0 {
+            return Err(format!("Leer lista de libmpv: {}", error_text(result)));
+        }
+        for index in 0..count.min(crate::stream_url::PLAYLIST_LIMIT as i64) {
+            let name = CString::new(format!("playlist/{index}/id")).expect("numeric playlist path");
+            let mut id: i64 = 0;
+            let result = unsafe {
+                mpv_get_property(context, name.as_ptr(), 4, (&mut id as *mut i64).cast())
+            };
+            if result < 0 {
+                return Err(format!("Leer elemento de libmpv: {}", error_text(result)));
+            }
+            if id == entry {
+                return Ok(index as usize);
+            }
+        }
+        Err("El elemento que fallo ya no figura en la lista de libmpv".to_owned())
+    }
+
     impl Playback {
         pub fn poll(&mut self, context: usize) {
-            if context == 0 {
+            if context == 0 || (self.stream_failure && self.error.is_some()) {
                 return;
             }
             // Event payloads belong to mpv and must be consumed before the next wait.
@@ -230,7 +304,22 @@ mod native {
                         if end.reason == 4 || end.error < 0 {
                             let message = error_text(end.error);
                             log::error!("libmpv END_FILE: {message} ({})", end.error);
-                            self.fail(message);
+                            if end.error == -13 {
+                                // playlist-pos may already point to the next item when events are polled.
+                                self.playlist_position =
+                                    match failed_playlist_index(context, end.entry) {
+                                        Ok(index) => index,
+                                        Err(error) => {
+                                            log::error!("{error}");
+                                            usize::MAX
+                                        }
+                                    };
+                                self.fail_stream(message);
+                            } else {
+                                self.fail(message);
+                            }
+                            // Let the UI recover before mpv skips to the next queued item.
+                            break;
                         } else if end.reason == 2 {
                             self.stop();
                             log::info!("libmpv END_FILE: detenido");
@@ -263,6 +352,7 @@ mod native {
                                         self.last_logged_position = Some(value);
                                     }
                                     self.position = Some(value);
+                                    self.last_position = Some(value);
                                 }
                             }
                             (2, 5, true) => {
@@ -307,6 +397,26 @@ pub use native::{error_text, subscribe};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_renewal_retains_service_until_stop_or_terminal_failure() {
+        let mut playback = Playback {
+            recovering: true,
+            ..Playback::default()
+        };
+        assert_eq!(playback.service_flags(), 41);
+        playback.paused = true;
+        assert_eq!(playback.service_flags(), 43);
+        playback.cancel();
+        assert_eq!(playback.service_flags() & 33, 0);
+        playback.fail("renewal failed".into());
+        assert_ne!(playback.service_flags() & 16, 0);
+        playback.loading();
+        assert_eq!(playback.service_flags() & 33, 1);
+        assert_eq!(playback.load_generation, 1);
+        playback.loading();
+        assert_eq!(playback.load_generation, 2);
+    }
 
     #[test]
     fn screen_stays_awake_only_during_playback() {
@@ -427,5 +537,35 @@ mod tests {
         state.record_error("error: Could not connect to server");
         state.fail("loading failed".to_owned());
         assert!(state.status().contains("conectar al servidor"));
+    }
+
+    #[test]
+    fn stream_failures_preserve_resume_state_but_tls_and_audio_do_not_retry() {
+        let mut state = Playback::default();
+        state.loading();
+        state.record_error("HTTP error 403 Forbidden");
+        state.last_position = Some(34.0);
+        state.playlist_position = 2;
+        state.fail_stream("loading failed".to_owned());
+        assert!(state.stream_failure);
+        assert_eq!(state.last_position, Some(34.0));
+        assert_eq!(state.playlist_position, 2);
+        state.loading();
+        state.record_error("TLS certificate verification failed");
+        state.fail_stream("loading failed".to_owned());
+        assert!(!state.stream_failure);
+        state.loading();
+        state.record_error("SSL handshake failed");
+        state.fail_stream("loading failed".to_owned());
+        assert!(!state.stream_failure);
+        state.loading();
+        state.record_error("audio output failed");
+        state.fail_stream("loading failed".to_owned());
+        assert!(!state.stream_failure);
+        state.loading();
+        state.fail("command failed".to_owned());
+        assert!(!state.stream_failure);
+        state.stop();
+        assert!(!state.stream_failure);
     }
 }

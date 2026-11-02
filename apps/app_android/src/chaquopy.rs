@@ -1,6 +1,6 @@
 use jni::objects::{JClass, JObject, JString, JValue};
 use jni::{Env, JavaVM, jni_sig, jni_str};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -93,8 +93,17 @@ pub fn ca_bundle_path() -> Result<String, String> {
 pub fn extract_stream_url(
     input: &str,
     audio_only: bool,
+    session: bool,
 ) -> Result<Receiver<Result<MediaInfo, String>>, String> {
-    submit(input, audio_only, None)
+    submit(input, audio_only, None, None, session)
+}
+
+pub fn retry_playback(
+    input: &str,
+    audio_only: bool,
+    cookies_only: bool,
+) -> Result<Receiver<Result<MediaInfo, String>>, String> {
+    submit(input, audio_only, None, Some(cookies_only), false)
 }
 
 /// Encola una resolucion anticipada. Si el `Arc` devuelto se suelta antes de
@@ -102,9 +111,16 @@ pub fn extract_stream_url(
 pub fn prefetch(
     input: &str,
     audio_only: bool,
+    session: bool,
 ) -> Result<(Receiver<Result<MediaInfo, String>>, Arc<()>), String> {
     let wanted = Arc::new(());
-    let receiver = submit(input, audio_only, Some(Arc::downgrade(&wanted)))?;
+    let receiver = submit(
+        input,
+        audio_only,
+        Some(Arc::downgrade(&wanted)),
+        None,
+        session,
+    )?;
     Ok((receiver, wanted))
 }
 
@@ -112,6 +128,8 @@ fn submit(
     input: &str,
     audio_only: bool,
     wanted: Option<Weak<()>>,
+    playback_retry: Option<bool>,
+    session: bool,
 ) -> Result<Receiver<Result<MediaInfo, String>>, String> {
     let (reply, receiver) = mpsc::channel();
     worker()?
@@ -119,7 +137,10 @@ fn submit(
         .send(Job {
             input: input.to_owned(),
             audio_only,
+            generation: GENERATION.load(Ordering::Acquire),
             wanted,
+            playback_retry,
+            session,
             reply,
         })
         .map_err(|_| "El worker de Python ya no esta disponible".to_owned())?;
@@ -137,7 +158,10 @@ pub enum Warmup {
 struct Job {
     input: String,
     audio_only: bool,
+    generation: i64,
     wanted: Option<Weak<()>>,
+    playback_retry: Option<bool>,
+    session: bool,
     reply: Sender<Result<MediaInfo, String>>,
 }
 
@@ -147,6 +171,90 @@ struct Worker {
 
 static WORKER: OnceLock<Result<Worker, String>> = OnceLock::new();
 static WARMUP: Mutex<Option<Warmup>> = Mutex::new(None);
+static GENERATION: AtomicI64 = AtomicI64::new(0);
+static PROGRESS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static ITEM_REPLY: Mutex<Option<(i64, Sender<Result<MediaInfo, String>>)>> = Mutex::new(None);
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_visualrustmpv_app_MainActivity_reportMediaExtractionItem(
+    _: *mut jni::sys::JNIEnv,
+    _: *mut std::ffi::c_void,
+    generation: i64,
+    media: jni::sys::jstring,
+) {
+    if generation != GENERATION.load(Ordering::Acquire) {
+        return;
+    }
+    let android = ndk_context::android_context();
+    let vm = unsafe { JavaVM::from_raw(android.vm() as *mut _) };
+    let result = vm
+        .attach_current_thread(|env| {
+            Ok::<_, jni::errors::Error>(unsafe { JString::from_raw(env, media) }.to_string())
+        })
+        .map_err(|error| format!("Leer elemento de la cola: {error}"))
+        .and_then(|json| MediaInfo::from_json(&json));
+    if let Err(error) = &result {
+        log::error!("{error}");
+    }
+    if let Some((active, reply)) = &*ITEM_REPLY.lock().expect("playlist reply lock") {
+        if *active == generation && generation == GENERATION.load(Ordering::Acquire) {
+            if reply.send(result).is_err() {
+                log::info!("La cola ya no espera elementos");
+            }
+        }
+    }
+}
+
+pub fn cancel_pending() {
+    GENERATION.fetch_add(1, Ordering::AcqRel);
+    PROGRESS.lock().expect("resolution progress lock").clear();
+    log::info!("Resolucion cancelada; se descartan trabajos y resultados pendientes");
+}
+
+pub fn take_progress() -> Vec<String> {
+    std::mem::take(&mut *PROGRESS.lock().expect("resolution progress lock"))
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_visualrustmpv_app_MainActivity_isMediaExtractionCancelled(
+    _: *mut std::ffi::c_void,
+    _: *mut std::ffi::c_void,
+    generation: i64,
+) -> u8 {
+    (generation != GENERATION.load(Ordering::Acquire)).into()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_visualrustmpv_app_MainActivity_reportMediaExtractionProgress(
+    _: *mut jni::sys::JNIEnv,
+    _: *mut std::ffi::c_void,
+    generation: i64,
+    message: jni::sys::jstring,
+) {
+    if generation != GENERATION.load(Ordering::Acquire) {
+        return;
+    }
+    let android = ndk_context::android_context();
+    let vm = unsafe { JavaVM::from_raw(android.vm() as *mut _) };
+    let message = match vm.attach_current_thread(|env| {
+        Ok::<_, jni::errors::Error>(unsafe { JString::from_raw(env, message) }.to_string())
+    }) {
+        Ok(message) => message,
+        Err(error) => {
+            log::error!("Leer progreso de resolucion: {error}");
+            return;
+        }
+    };
+    log::info!("Resolucion: {message}");
+    let mut progress = PROGRESS.lock().expect("resolution progress lock");
+    if generation != GENERATION.load(Ordering::Acquire) {
+        return;
+    }
+    if progress.len() == 32 {
+        progress.remove(0);
+    }
+    progress.push(message);
+}
 
 fn worker() -> Result<&'static Worker, String> {
     WORKER
@@ -339,16 +447,21 @@ fn spawn_worker() -> Result<Worker, String> {
                 }
             }
             for job in queue {
-                if job
-                    .wanted
-                    .as_ref()
-                    .is_some_and(|wanted| wanted.upgrade().is_none())
+                if job.generation != GENERATION.load(Ordering::Acquire)
+                    || job
+                        .wanted
+                        .as_ref()
+                        .is_some_and(|wanted| wanted.upgrade().is_none())
                 {
                     log::info!("Precarga descartada antes de empezar");
                     continue;
                 }
                 let started = std::time::Instant::now();
                 log::info!("Worker Python: resolviendo con yt-dlp precargado");
+                *ITEM_REPLY.lock().expect("playlist reply lock") = job
+                    .playback_retry
+                    .is_none()
+                    .then(|| (job.generation, job.reply.clone()));
                 let result = vm
                     .attach_current_thread(|env| {
                         let result = (|| {
@@ -356,9 +469,17 @@ fn spawn_worker() -> Result<Worker, String> {
                             let value = env
                                 .call_static_method(
                                     &class,
-                                    jni_str!("extractMedia"),
-                                    jni_sig!("(Ljava/lang/String;Z)Ljava/lang/String;"),
-                                    &[JValue::Object(&url), JValue::Bool(job.audio_only)],
+                                    jni_str!("extractMediaCancellable"),
+                                    jni_sig!("(Ljava/lang/String;ZZZJ)Ljava/lang/String;"),
+                                    &[
+                                        JValue::Object(&url),
+                                        JValue::Bool(job.audio_only),
+                                        JValue::Bool(
+                                            job.session || job.playback_retry.unwrap_or(false),
+                                        ),
+                                        JValue::Bool(job.playback_retry.is_some()),
+                                        JValue::Long(job.generation),
+                                    ],
                                 )?
                                 .l()?;
                             if value.is_null() {
@@ -371,6 +492,7 @@ fn spawn_worker() -> Result<Worker, String> {
                     })
                     .map_err(|error: BridgeError| format!("Chaquopy/yt-dlp: {}", error.0))
                     .and_then(|value| MediaInfo::from_json(&value));
+                *ITEM_REPLY.lock().expect("playlist reply lock") = None;
                 let elapsed = started.elapsed().as_secs_f64();
                 match &result {
                     Ok(media) => log::info!(

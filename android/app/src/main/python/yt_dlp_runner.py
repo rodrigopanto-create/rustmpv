@@ -5,11 +5,14 @@ from itertools import islice
 import json
 import os
 import subprocess
+import sys
 import time
-from urllib.parse import urlsplit
+from typing import Callable, Protocol, TypeVar
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
+import anonymous_provider
 
 
 def _validate_stream_url(value: object) -> str:
@@ -28,6 +31,53 @@ def _validate_stream_url(value: object) -> str:
     ):
         raise RuntimeError("yt-dlp devolvio una URL de stream no permitida")
     return value
+
+
+def _youtube_host(host: str | None) -> bool:
+    host = (host or "").lower().rstrip(".")
+    return any(host == domain or host.endswith("." + domain)
+               for domain in ("youtube.com", "youtube-nocookie.com", "youtu.be"))
+
+
+def _normalize_youtube_url(url: str) -> str:
+    for _ in range(3):
+        parsed = urlsplit(url)
+        if not _youtube_host(parsed.hostname):
+            return url
+        query = parse_qsl(parsed.query, keep_blank_values=True)
+        if parsed.path == "/playlist" and not any(key == "v" for key, _ in query):
+            playlist = next((value for key, value in query if key == "list"), "")
+            for prefix in ("RDAMVM", "RD"):
+                seed = playlist.removeprefix(prefix)
+                if playlist.startswith(prefix) and len(seed) == 11 and all(
+                    character.isascii() and (character.isalnum() or character in "-_")
+                    for character in seed
+                ):
+                    return urlunsplit((
+                        parsed.scheme, parsed.netloc, "/watch",
+                        urlencode([("v", seed), *query]), parsed.fragment))
+        if parsed.path in ("/attribution_link", "/redirect"):
+            target = next((value for key, value in query if key in ("u", "q", "url")), "")
+            target = urljoin("https://www.youtube.com/", target)
+            if not _youtube_host(urlsplit(target).hostname):
+                raise RuntimeError("El enlace compartido no apunta a YouTube")
+            url = _validate_stream_url(target)
+            continue
+        parts = parsed.path.strip("/").split("/")
+        short = (parsed.hostname or "").lower().rstrip(".") == "youtu.be"
+        if short or (len(parts) == 2 and parts[0] in ("shorts", "live", "embed", "v")):
+            video_id = parts[0] if short else parts[1]
+            if video_id == "videoseries":
+                query = [(key, value) for key, value in query if key != "v"]
+                path = "/playlist"
+            else:
+                query = [(key, value) for key, value in query if key != "v"]
+                query.insert(0, ("v", video_id))
+                path = "/watch"
+            host = "music.youtube.com" if parsed.hostname == "music.youtube.com" else "www.youtube.com"
+            return urlunsplit(("https", host, path, urlencode(query), parsed.fragment))
+        return url
+    raise RuntimeError("Demasiadas redirecciones en el enlace compartido de YouTube")
 
 
 @cache
@@ -65,6 +115,81 @@ _PLAYER_CACHE_LIMIT = 2
 # Long-lived downloaders keyed by (audio_only, runtime_path, cache_dir). Their
 # YouTube extractor keeps player code and solved n/sig challenges in memory.
 _downloaders: dict[tuple[bool, str, str | None], YoutubeDL] = {}
+_request: tuple["ExtractionBridge", int] | None = None
+_streaming = False
+_published = False
+_account_downloader: YoutubeDL | None = None
+_T = TypeVar("_T")
+
+
+class ExtractionCancelled(BaseException):
+    """Must not be swallowed by extractor errors or account fallback."""
+
+
+class ExtractionBridge(Protocol):
+    def isMediaExtractionCancelled(self, generation: int) -> bool: ...
+
+    def reportMediaExtractionProgress(self, generation: int, message: str) -> None: ...
+
+    def reportMediaExtractionItem(self, generation: int, media: str) -> None: ...
+
+
+def _progress(message: str) -> None:
+    print(f"[Proceso] {message}", flush=True)
+    if _request is not None:
+        bridge, generation = _request
+        bridge.reportMediaExtractionProgress(generation, message)
+
+
+def _interruptible(action: Callable[[], _T]) -> _T:
+    if _request is None:
+        return action()
+    bridge, generation = _request
+    previous = sys.gettrace()
+    next_check = 0.0
+
+    def check(frame, event, arg):
+        nonlocal next_check
+        now = time.monotonic()
+        if now >= next_check:
+            next_check = now + 0.1
+            if bridge.isMediaExtractionCancelled(generation):
+                raise ExtractionCancelled()
+        return check
+
+    try:
+        sys.settrace(check)
+        if bridge.isMediaExtractionCancelled(generation):
+            raise ExtractionCancelled()
+        return action()
+    finally:
+        sys.settrace(previous)
+
+
+def extract_media_request(
+    url: str, audio_only: bool, runtime_path: str, cache_dir: str | None,
+    cookie_bridge, cookies_only: bool, refresh: bool, generation: int,
+) -> str:
+    global _request, _streaming, _published
+    _request = (cookie_bridge, generation)
+    _streaming = not refresh
+    _published = False
+    try:
+        _progress("Preparando resolucion; las comprobaciones de JavaScript pueden tardar.")
+        result = extract_media_with_fallback(
+            url, audio_only, runtime_path, cache_dir, cookie_bridge, cookies_only, refresh)
+        _progress("Enlace resuelto; cargando en el player.")
+        return result
+    except ExtractionCancelled as error:
+        print("[Proceso] Resolucion cancelada por el usuario", flush=True)
+        raise RuntimeError("Resolucion cancelada por el usuario") from error
+    except Exception:
+        _progress("No se pudo resolver el enlace. El proceso ha terminado.")
+        raise
+    finally:
+        _request = None
+        _streaming = False
+        _published = False
 
 # yt-dlp reports these when a post exists but is hidden from anonymous visitors.
 _LOGIN_REQUIRED_HINTS = (
@@ -85,19 +210,33 @@ class _ErrorLog:
 
     def __init__(self) -> None:
         self.last: str | None = None
+        self.invalid_youtube_session = False
 
     def debug(self, message: str) -> None:
-        pass
+        if not message.startswith("[debug]"):
+            self.info(message)
 
     def info(self, message: str) -> None:
-        pass
+        print(f"[yt-dlp] {message}", flush=True)
+        lower = message.lower()
+        # Show stages, never extractor URLs, signed query strings or credentials.
+        if "po token" in lower:
+            _progress("Generando o comprobando PO Token local...")
+        elif any(word in lower for word in ("challenge", "javascript", "player")):
+            _progress("Procesando el cliente y JavaScript del sitio...")
+        elif any(word in lower for word in ("downloading", "extracting", "playlist")):
+            _progress("Consultando el sitio y sus formatos de reproduccion...")
 
     def warning(self, message: str) -> None:
+        if "youtube account cookies are no longer valid" in message.lower():
+            self.invalid_youtube_session = True
         print(f"[yt-dlp] {message}", flush=True)
+        _progress("El sitio dio un aviso; la resolucion sigue en curso.")
 
     def error(self, message: str) -> None:
         self.last = message
         print(f"[yt-dlp] {message}", flush=True)
+        _progress("Fallo en este intento; comprobando si es posible el fallback.")
 
 
 _errors = _ErrorLog()
@@ -117,11 +256,16 @@ def _failure_message(error: str | None) -> str:
     return f"yt-dlp no pudo extraer el medio: {reason}"
 
 
-def _options(audio_only: bool, runtime_path: str, cache_dir: str | None) -> dict:
-    return {
+def _options(
+    audio_only: bool, runtime_path: str, cache_dir: str | None,
+    cookie_file: str | None = None,
+) -> dict:
+    options = {
         "logger": _errors,
         "noplaylist": False,
         "playlistend": _PLAYLIST_LIMIT,
+        "extract_flat": "in_playlist",
+        "lazy_playlist": True,
         "quiet": True,
         "skip_download": True,
         "ignoreerrors": True,
@@ -131,11 +275,23 @@ def _options(audio_only: bool, runtime_path: str, cache_dir: str | None) -> dict
         "js_runtimes": {"quickjs": {"path": runtime_path}},
         "remote_components": set(),
         "cachedir": cache_dir if cache_dir else False,
+        "usenetrc": False,
         "format": _AUDIO_FORMAT if audio_only else _VIDEO_FORMAT,
     }
+    if cookie_file:
+        options["cookiefile"] = cookie_file
+        return options
+    provider_options = anonymous_provider.options()
+    options["js_runtimes"].update(provider_options["js_runtimes"])
+    options["extractor_args"] = provider_options["extractor_args"]
+    return options
 
 
-def _downloader(audio_only: bool, runtime_path: str, cache_dir: str | None) -> YoutubeDL:
+def _downloader(
+    audio_only: bool,
+    runtime_path: str,
+    cache_dir: str | None,
+) -> YoutubeDL:
     key = (audio_only, runtime_path, cache_dir)
     downloader = _downloaders.get(key)
     if downloader is None:
@@ -178,7 +334,11 @@ def _prune_player_cache(cache_dir: str | None, keep: int = _PLAYER_CACHE_LIMIT) 
             print(f"[yt-dlp] No se pudo borrar {entry.name}: {error}", flush=True)
 
 
-def _discard_downloader(audio_only: bool, runtime_path: str, cache_dir: str | None) -> None:
+def _discard_downloader(
+    audio_only: bool,
+    runtime_path: str,
+    cache_dir: str | None,
+) -> None:
     downloader = _downloaders.pop((audio_only, runtime_path, cache_dir), None)
     if downloader is not None:
         try:
@@ -302,13 +462,160 @@ def _thumbnail_candidates(info: dict) -> list[str]:
 
 
 def extract_media(
-    url: str, audio_only: bool, runtime_path: str, cache_dir: str | None = None
+    url: str,
+    audio_only: bool,
+    runtime_path: str,
+    cache_dir: str | None = None,
 ) -> str:
-    """Resolve the direct stream plus lock-screen metadata as a JSON object."""
+    """Resolve anonymously; never load saved account cookies or credentials."""
     _validate_stream_url(url)
+    try:
+        return _extract_media(_normalize_youtube_url(url), audio_only, runtime_path, cache_dir)
+    except ExtractionCancelled:
+        _discard_downloader(audio_only, runtime_path, cache_dir)
+        raise
+
+
+class CookieFallbackBridge(Protocol):
+    def prepareAnonymousExtraction(self) -> str: ...
+
+    def prepareSupportedSiteCookiesForFallback(self, url: str) -> str: ...
+
+    def setSupportedSiteCookiesFallbackStatus(self, status: str) -> None: ...
+
+
+def extract_media_with_fallback(
+    url: str,
+    audio_only: bool,
+    runtime_path: str,
+    cache_dir: str | None,
+    cookie_bridge: CookieFallbackBridge,
+    cookies_only: bool = False,
+    refresh: bool = False,
+) -> str:
+    """Try the guest first; decrypt account cookies only after extraction fails."""
+    _validate_stream_url(url)
+    url = _normalize_youtube_url(url)
+    if cookies_only:
+        _progress("Usando la sesion guardada para conservar la lista o renovar su stream...")
+        return _account_media(url, audio_only, runtime_path, cache_dir, cookie_bridge)
+    try:
+        if refresh:
+            _discard_downloader(audio_only, runtime_path, cache_dir)
+        _progress("Preparando el intento anonimo y el proveedor local...")
+        provider_error = _interruptible(cookie_bridge.prepareAnonymousExtraction)
+        if provider_error:
+            raise RuntimeError(provider_error)
+        _progress("Resolviendo sin cuenta...")
+        return _interruptible(lambda: extract_media(url, audio_only, runtime_path, cache_dir))
+    except (DownloadError, RuntimeError) as anonymous_error:
+        if _published:
+            raise RuntimeError(
+                "La cola quedo incompleta; se conservan los elementos ya resueltos. "
+                f"No se cambia de sesion: {_clean_text(str(anonymous_error))}"
+            ) from anonymous_error
+        print(f"[yt-dlp] Intento anonimo fallo: {_clean_text(str(anonymous_error))}", flush=True)
+        _progress("El intento anonimo fallo; comprobando cookies de este sitio...")
+        try:
+            return _account_media(
+                url, audio_only, runtime_path, cache_dir, cookie_bridge, fallback=True)
+        except (DownloadError, RuntimeError) as cookie_error:
+            raise RuntimeError(
+                f"Intento anonimo: {_clean_text(str(anonymous_error))}. "
+                f"Intento con cookies: {_clean_text(str(cookie_error))}"
+            ) from cookie_error
+
+
+def _account_media(
+    url: str, audio_only: bool, runtime_path: str, cache_dir: str | None,
+    cookie_bridge: CookieFallbackBridge, fallback: bool = False,
+) -> str:
+    global _account_downloader
+    cookie_file = cookie_bridge.prepareSupportedSiteCookiesForFallback(url)
+    if not cookie_file:
+        raise RuntimeError(
+            "No hay cookies guardadas para este sitio; importa cookies.txt de tu cuenta. "
+            "No se sustituye una lista personal por recomendaciones anonimas.")
+    downloader = None
+    try:
+        cookie_bridge.setSupportedSiteCookiesFallbackStatus("fallback" if fallback else "session")
+        _progress("Resolviendo con la sesion guardada; comprobando acceso a la lista...")
+        downloader = YoutubeDL(_options(audio_only, runtime_path, cache_dir, cookie_file))
+        require_youtube_session = not fallback and _youtube_host(urlsplit(url).hostname)
+        _errors.invalid_youtube_session = False
+        if require_youtube_session and not downloader.get_info_extractor("Youtube").is_authenticated:
+            raise RuntimeError(
+                "Las cookies no contienen una sesion de YouTube activa; "
+                "exporta e importa cookies.txt de nuevo.")
+        _account_downloader = downloader
+        result = json.loads(_interruptible(
+            lambda: _extract_media(url, audio_only, runtime_path, cache_dir, downloader)))
+        if require_youtube_session and (
+            _errors.invalid_youtube_session
+            or not downloader.get_info_extractor("Youtube").is_authenticated
+        ):
+            raise RuntimeError(
+                "La sesion de YouTube dejo de ser valida durante la consulta; "
+                "exporta e importa cookies.txt de nuevo. No se usara una lista anonima.")
+        result["used_cookies"] = True
+        return json.dumps(result)
+    finally:
+        _account_downloader = None
+        if downloader is not None:
+            try:
+                downloader.close()
+            except Exception as error:
+                print(f"[yt-dlp] Cerrar instancia con cookies: {error}", flush=True)
+        try:
+            os.remove(cookie_file)
+        except OSError as error:
+            print(f"[yt-dlp] No se pudo eliminar el archivo temporal de cookies: {error}", flush=True)
+            raise RuntimeError("No se pudo eliminar el archivo temporal de cookies") from error
+
+
+def _check_account_playlist_session(youtube: bool) -> None:
+    if _account_downloader is not None and youtube and (
+        _errors.invalid_youtube_session
+        or not _account_downloader.get_info_extractor("Youtube").is_authenticated
+    ):
+        raise RuntimeError(
+            "La sesion de YouTube no es valida; importa cookies actuales. "
+            "No se usara una lista anonima.")
+
+
+def _publish_playlist(media: list[dict], skipped: int, youtube: bool) -> None:
+    global _published
+    if not _streaming or _request is None:
+        return
+    _check_account_playlist_session(youtube)
+    result = dict(media[0])
+    result.update(
+        playlist=[item["url"] for item in media[1:]],
+        entry_ids=[item["entry_id"] for item in media],
+        used_cookies=_account_downloader is not None,
+        playlist_pending=True,
+        playlist_notice=(
+            f"Cola: {len(media)} listos, {skipped} omitidos; "
+            f"resolviendo el resto (limite {_PLAYLIST_LIMIT})."),
+    )
+    bridge, generation = _request
+    bridge.reportMediaExtractionItem(generation, json.dumps(result))
+    _published = True
+
+
+def _extract_media(
+    url: str,
+    audio_only: bool,
+    runtime_path: str,
+    cache_dir: str | None,
+    downloader: YoutubeDL | None = None,
+) -> str:
+    """Resolve media with a reusable guest downloader."""
     _check_js_runtime(runtime_path)
     started = time.monotonic()
-    downloader = _downloader(audio_only, runtime_path, cache_dir)
+    guest = downloader is None
+    if downloader is None:
+        downloader = _downloader(audio_only, runtime_path, cache_dir)
     _errors.last = None
     try:
         info = downloader.extract_info(url, download=False)
@@ -318,7 +625,8 @@ def extract_media(
         raise
     except BaseException:
         # Never reuse an instance whose extractor may have been left half-updated.
-        _discard_downloader(audio_only, runtime_path, cache_dir)
+        if guest:
+            _discard_downloader(audio_only, runtime_path, cache_dir)
         _prune_player_cache(cache_dir, keep=0)
         raise
     _prune_player_cache(cache_dir)
@@ -330,18 +638,18 @@ def extract_media(
     if not isinstance(info, dict):
         raise RuntimeError(_failure_message(_errors.last))
     if info.get("_type") in ("playlist", "multi_video"):
+        _check_account_playlist_session(_youtube_host(urlsplit(url).hostname))
         entries = info.get("entries")
         if entries is None:
             raise RuntimeError("yt-dlp devolvio una lista sin elementos")
-        selected = list(islice(entries, _PLAYLIST_LIMIT + 1))
+        _progress(f"Leyendo lista: hasta {_PLAYLIST_LIMIT} elementos por carga...")
+        selected = list(islice(entries, _PLAYLIST_LIMIT))
         if not selected:
             raise RuntimeError("La lista no contiene elementos reproducibles")
-        if len(selected) > _PLAYLIST_LIMIT:
-            print(f"[yt-dlp] Lista limitada a {_PLAYLIST_LIMIT} elementos", flush=True)
-            selected = selected[:_PLAYLIST_LIMIT]
         media = []
         skipped = 0
         for index, entry in enumerate(selected, 1):
+            _progress(f"Resolviendo elemento {index}/{len(selected)} de la lista...")
             if entry is None:
                 skipped += 1
                 continue
@@ -358,6 +666,10 @@ def extract_media(
                         ),
                         None,
                     )
+                    video_id = entry.get("id")
+                    if _youtube_host(urlsplit(url).hostname) and isinstance(video_id, str) and video_id:
+                        # Resolve only the track, not its watch?list=... radio again.
+                        entry_url = f"https://www.youtube.com/watch?{urlencode({'v': video_id})}"
                     if entry_url is None:
                         video_id = entry.get("id")
                         if (
@@ -379,10 +691,18 @@ def extract_media(
             except RuntimeError as error:
                 skipped += 1
                 print(f"[yt-dlp] Se omite elemento {index}: {error}", flush=True)
+                continue
+            _publish_playlist(media, skipped, _youtube_host(urlsplit(url).hostname))
         if not media:
-            raise RuntimeError("La lista no contiene elementos reproducibles")
+            raise RuntimeError(f"La lista no contiene elementos reproducibles: {_failure_message(_errors.last)}")
         result = media[0]
         result["playlist"] = [item["url"] for item in media[1:]]
+        result["entry_ids"] = [item["entry_id"] for item in media]
+        result["playlist_notice"] = (
+            f"Lista: {len(media)} reproducibles, {skipped} omitidos. "
+            f"Limite: {_PLAYLIST_LIMIT} por carga."
+        )
+        _progress(result["playlist_notice"])
         print(
             f"[yt-dlp] Lista resuelta: {len(media)} elementos; "
             f"{skipped} omitidos",
@@ -404,4 +724,5 @@ def _media_payload(info: object) -> dict:
         "title": _clean_text(info.get("title")),
         "artist": _clean_text(info.get("channel") or info.get("uploader")),
         "thumbnails": _thumbnail_candidates(info),
+        "entry_id": _clean_text(info.get("id") or info.get("webpage_url")),
     }
