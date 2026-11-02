@@ -86,9 +86,15 @@ class RunnerTests(unittest.TestCase):
 
     def test_requested_direct_stream(self):
         self.downloader.extract_info.return_value = {
-            "requested_downloads": [{"url": "https://cdn.example/audio"}]}
-        self.assertEqual(self.resolve("https://youtube.com/watch?v=12345678901", True),
-                         "https://cdn.example/audio")
+            "requested_downloads": [{
+                "url": "https://cdn.example/audio",
+                "ext": "webm",
+                "protocol": "https",
+            }]}
+        media = self.media("https://youtube.com/watch?v=12345678901", True)
+        self.assertEqual(media["url"], "https://cdn.example/audio")
+        self.assertEqual(media["extension"], "webm")
+        self.assertEqual(media["protocol"], "https")
 
     def test_all_sites_use_guest_downloader_without_account_credentials(self):
         self.downloader.extract_info.return_value = {"url": "https://cdn.example/video"}
@@ -361,7 +367,12 @@ class RunnerTests(unittest.TestCase):
         self.downloader.extract_info.return_value = {
             "_type": "playlist",
             "entries": [
-                {"url": f"https://cdn.example/{index}", "title": f"Track {index}"}
+                {
+                    "url": f"https://cdn.example/{index}",
+                    "title": f"Track {index}",
+                    "ext": "mp4",
+                    "protocol": "https",
+                }
                 for index in range(3)
             ],
         }
@@ -371,6 +382,8 @@ class RunnerTests(unittest.TestCase):
             media["playlist"],
             ["https://cdn.example/1", "https://cdn.example/2"],
         )
+        self.assertEqual(media["playlist_extensions"], ["mp4", "mp4"])
+        self.assertEqual(media["playlist_protocols"], ["https", "https"])
         self.assertEqual(self.downloader.extract_info.call_count, 1)
 
     def test_youtube_shared_links_preserve_playlist_and_music_context(self):
@@ -531,7 +544,12 @@ class RunnerTests(unittest.TestCase):
             if "lmnopqrstuv" in url:
                 self.assertEqual(len(emitted), 1)
                 self.assertEqual(emitted[0][1]["url"], "https://cdn.example/abcdefghijk")
-            return {"id": url.split("v=")[1], "url": "https://cdn.example/" + url.split("v=")[1]}
+            return {
+                "id": url.split("v=")[1],
+                "url": "https://cdn.example/" + url.split("v=")[1],
+                "ext": "m4a",
+                "protocol": "https",
+            }
 
         self.downloader.extract_info.side_effect = extract
         final = json.loads(self.runner.extract_media_request(
@@ -540,8 +558,12 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual([generation for generation, _ in emitted], [42, 42])
         self.assertTrue(all(media["playlist_pending"] for _, media in emitted))
         self.assertEqual(len(emitted[-1][1]["playlist"]), 1)
+        self.assertEqual(emitted[-1][1]["playlist_extensions"], ["m4a"])
+        self.assertEqual(emitted[-1][1]["playlist_protocols"], ["https"])
         self.assertFalse(final.get("playlist_pending", False))
         self.assertEqual(final["entry_ids"], ["abcdefghijk", "lmnopqrstuv"])
+        self.assertEqual(final["playlist_extensions"], ["m4a"])
+        self.assertEqual(final["playlist_protocols"], ["https"])
         self.assertFalse(self.runner._streaming)
 
     def test_partial_guest_queue_never_switches_to_account_after_publication_error(self):

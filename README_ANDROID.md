@@ -58,6 +58,10 @@ Rust calls `MainActivity.extractMedia` through JNI from one persistent
 extracted stdlib, or Python C-API library is needed. The validated direct URL
 returns through `mpsc` to libmpv's `loadfile`. Python/Java exceptions are reported
 in the UI and logs, without silently falling back to remote resolvers.
+On launch, a short splash screen covers the player controls while the Python
+worker initializes; it disappears when yt-dlp is ready, with an eight-second
+maximum so a slow warm-up cannot block the app. YouTube-player cache warming
+continues in the background after the player screen appears.
 
 ### Persistent Python worker
 
@@ -96,6 +100,10 @@ the selection survives subsequent loads in the same app session. Narrow portrait
 layouts put the seek bar below the transport buttons. The URL, resolver status,
 video and history share a clipped scrollable area above the controls, with the
 keyboard's visible window boundary reserved so history cannot paint over them.
+**Descargar medio actual** sends the selected playlist item to Android's public
+`Downloads` folder through `DownloadManager`; Android owns background progress
+and its completion notification. The button is enabled only for recognized
+single-file HTTP(S) formats, not HLS/DASH manifests.
 
 Important resolver stages remain in Android logs and the bounded **Consola del
 proceso** panel: guest preparation, site/format requests, JavaScript/PO Token work,

@@ -131,11 +131,14 @@ struct AndroidAppState {
     keep_awake_request: Option<Receiver<Result<(), String>>>,
     keep_awake: bool,
     service_request: Option<Receiver<Result<(), String>>>,
+    download_request: Option<Receiver<Result<String, String>>>,
     last_media: Option<(String, PlaybackMode, stream_url::MediaInfo)>,
     cancelled_input: Option<String>,
     last_resolved_at: Option<std::time::Instant>,
     #[cfg(feature = "chaquopy")]
     python_warmup: Option<chaquopy::Warmup>,
+    #[cfg(feature = "chaquopy")]
+    startup_splash_started: std::time::Instant,
     #[cfg(feature = "chaquopy")]
     prefetch: prefetch::Prefetcher<stream_url::MediaInfo>,
     /// Mantiene en la cola del worker una precarga que Play adopto.
@@ -196,6 +199,39 @@ impl AndroidAppState {
         self.resolving()
     }
 
+    fn poll_download(&mut self) {
+        let result =
+            self.download_request
+                .as_ref()
+                .and_then(|receiver| match receiver.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(mpsc::TryRecvError::Disconnected) => Some(Err(
+                        "Android no devolvio el resultado de la descarga".to_owned(),
+                    )),
+                    Err(mpsc::TryRecvError::Empty) => None,
+                });
+        if let Some(result) = result {
+            self.download_request = None;
+            match result {
+                Ok(id) if id == "permission-required" => {
+                    self.status =
+                        "Concede el permiso de almacenamiento y vuelve a descargar".to_owned();
+                    self.process_message(self.status.clone());
+                }
+                Ok(id) => {
+                    log::info!("Descarga enviada a Android DownloadManager ({id})");
+                    self.status = "Descarga iniciada; revisa la notificacion de Android".to_owned();
+                    self.process_message(self.status.clone());
+                }
+                Err(error) => {
+                    log::error!("Encolar descarga en Android: {error}");
+                    self.status = format!("No se pudo iniciar la descarga: {error}");
+                    self.process_message(self.status.clone());
+                }
+            }
+        }
+    }
+
     fn new(
         android_app: winit::platform::android::activity::AndroidApp,
         gl: Option<&eframe::glow::Context>,
@@ -225,6 +261,8 @@ impl AndroidAppState {
         };
         history::init(android_app.internal_data_path().as_deref());
         let playback = lifecycle::register(mpv_context);
+        #[cfg(feature = "chaquopy")]
+        let startup_splash_started = std::time::Instant::now();
         #[cfg(feature = "chaquopy")]
         if let Err(error) = chaquopy::start_worker() {
             log::error!("No se pudo iniciar el worker Python: {error}");
@@ -264,11 +302,14 @@ impl AndroidAppState {
             keep_awake_request: None,
             keep_awake: false,
             service_request: None,
+            download_request: None,
             last_media: None,
             cancelled_input: None,
             last_resolved_at: None,
             #[cfg(feature = "chaquopy")]
             python_warmup: None,
+            #[cfg(feature = "chaquopy")]
+            startup_splash_started,
             #[cfg(feature = "chaquopy")]
             prefetch: prefetch::Prefetcher::default(),
             #[cfg(feature = "chaquopy")]
@@ -304,6 +345,21 @@ fn system_bar_margins(content: [i32; 4], window: [i32; 2], pixels_per_point: f32
     }
 }
 
+#[cfg(any(all(target_os = "android", feature = "chaquopy"), test))]
+const STARTUP_SPLASH_MINIMUM: std::time::Duration = std::time::Duration::from_millis(900);
+#[cfg(any(all(target_os = "android", feature = "chaquopy"), test))]
+const STARTUP_SPLASH_MAXIMUM: std::time::Duration = std::time::Duration::from_secs(8);
+
+#[cfg(any(all(target_os = "android", feature = "chaquopy"), test))]
+fn startup_splash_visible(
+    started: std::time::Instant,
+    warmup_pending: bool,
+    now: std::time::Instant,
+) -> bool {
+    let elapsed = now.saturating_duration_since(started);
+    elapsed < STARTUP_SPLASH_MINIMUM || (warmup_pending && elapsed < STARTUP_SPLASH_MAXIMUM)
+}
+
 #[cfg(target_os = "android")]
 impl eframe::App for AndroidAppState {
     /// Dibuja la interfaz Android y expone el formato directo elegido.
@@ -336,6 +392,7 @@ impl eframe::App for AndroidAppState {
             }
         }
         self.poll_stream();
+        self.poll_download();
         #[cfg(feature = "chaquopy")]
         {
             lifecycle::update_input(self.url.trim());
@@ -346,6 +403,44 @@ impl eframe::App for AndroidAppState {
             self.poll_recovery();
             self.poll_python_worker();
             self.poll_prefetch();
+        }
+        #[cfg(feature = "chaquopy")]
+        {
+            let now = std::time::Instant::now();
+            let warmup_pending = matches!(chaquopy::warmup(), Some(chaquopy::Warmup::Pending));
+            let splash_visible =
+                startup_splash_visible(self.startup_splash_started, warmup_pending, now);
+            if splash_visible {
+                context.request_repaint_after(std::time::Duration::from_millis(80));
+            } else if warmup_pending {
+                context.request_repaint_after(std::time::Duration::from_millis(500));
+            }
+            if splash_visible {
+                let mut splash_frame = egui::Frame::central_panel(&context.style());
+                splash_frame.fill = egui::Color32::from_rgb(12, 18, 30);
+                egui::CentralPanel::default()
+                    .frame(splash_frame)
+                    .show(context, |ui| {
+                        ui.with_layout(
+                            egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                            |ui| {
+                                ui.vertical_centered(|ui| {
+                                    ui.heading(
+                                        egui::RichText::new("VisualRustMPV")
+                                            .size(32.0)
+                                            .strong()
+                                            .color(egui::Color32::from_rgb(113, 190, 255)),
+                                    );
+                                    ui.add_space(16.0);
+                                    ui.add(egui::Spinner::new().size(28.0));
+                                    ui.add_space(12.0);
+                                    ui.label("Preparando el motor multimedia...");
+                                });
+                            },
+                        );
+                    });
+                return;
+            }
         }
         let previous = self.status.clone();
         let process_pending = self.process_pending();
@@ -665,6 +760,7 @@ impl eframe::App for AndroidAppState {
                 } else if let Some(error) = &playback.error {
                     ui.colored_label(egui::Color32::LIGHT_RED, format!("Error: {error}"));
                 }
+                self.draw_download(ui, &playback);
                 if self.playing_mode == PlaybackMode::Video {
                     let width = ui.available_width();
                     let height = (width * 9.0 / 16.0).min(ui.available_height()).max(1.0);
@@ -894,6 +990,42 @@ impl AndroidAppState {
             ));
             self.cookie_poll_at = std::time::Instant::now() + std::time::Duration::from_millis(300);
             context.request_repaint_after(std::time::Duration::from_millis(300));
+        }
+    }
+
+    fn draw_download(&mut self, ui: &mut egui::Ui, playback: &playback::Playback) {
+        let Some((referer, audio_only, target)) =
+            self.last_media.as_ref().map(|(input, mode, media)| {
+                (
+                    input.clone(),
+                    *mode == PlaybackMode::Audio,
+                    media.download_target(playback.playlist_position),
+                )
+            })
+        else {
+            return;
+        };
+        let unavailable = target.as_ref().err().cloned();
+        let enabled =
+            playback.active && playback.loaded && self.download_request.is_none() && target.is_ok();
+        let button = ui.add_enabled(enabled, egui::Button::new("Descargar medio actual"));
+        let clicked = button.clicked();
+        if let Some(reason) = unavailable {
+            button.on_hover_text(&reason);
+            ui.weak(reason);
+        } else {
+            button.on_hover_text("Guardar el stream actual en Descargas de Android");
+        }
+        if clicked && let Ok(target) = target {
+            self.status = format!("Preparando descarga de {}...", target.title);
+            self.download_request = Some(screen::download_media(
+                &self.android_app,
+                target.url,
+                target.title,
+                target.extension,
+                referer,
+                audio_only,
+            ));
         }
     }
 
@@ -1179,6 +1311,7 @@ impl AndroidAppState {
         let loaded = load_media(self.mpv_context, &media, self.mode, resume, false);
         match loaded {
             Ok(()) => {
+                playback.playlist_position = 0;
                 playback.loading();
                 self.playing_mode = self.mode;
                 self.seek_position = None;
@@ -2224,7 +2357,8 @@ pub fn desktop_placeholder() -> &'static str {
 #[cfg(test)]
 mod layout_tests {
     use super::{
-        MediaSite, is_youtube_playlist_url, media_site, system_bar_margins, user_facing_error,
+        MediaSite, STARTUP_SPLASH_MAXIMUM, STARTUP_SPLASH_MINIMUM, is_youtube_playlist_url,
+        media_site, startup_splash_visible, system_bar_margins, user_facing_error,
     };
     use eframe::egui;
 
@@ -2327,6 +2461,31 @@ mod layout_tests {
         ] {
             assert_eq!(media_site(url), Some(site), "{url}");
         }
+    }
+
+    #[test]
+    fn startup_splash_waits_for_warmup_but_has_a_bounded_duration() {
+        let started = std::time::Instant::now();
+        assert!(startup_splash_visible(
+            started,
+            false,
+            started + STARTUP_SPLASH_MINIMUM / 2
+        ));
+        assert!(startup_splash_visible(
+            started,
+            true,
+            started + STARTUP_SPLASH_MINIMUM
+        ));
+        assert!(!startup_splash_visible(
+            started,
+            false,
+            started + STARTUP_SPLASH_MINIMUM
+        ));
+        assert!(!startup_splash_visible(
+            started,
+            true,
+            started + STARTUP_SPLASH_MAXIMUM
+        ));
     }
 
     #[test]

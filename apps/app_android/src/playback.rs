@@ -47,11 +47,13 @@ impl Playback {
     }
 
     pub fn loading(&mut self) {
+        let playlist_position = self.playlist_position;
         *self = Self {
             active: true,
             // mpv only re-emits observed properties when their values change.
             paused: self.paused,
             audio_output: self.audio_output.take(),
+            playlist_position,
             cancel_generation: self.cancel_generation,
             load_generation: self.load_generation.wrapping_add(1),
             ..Self::default()
@@ -212,6 +214,7 @@ mod native {
             (c"pause", 3),
             (c"paused-for-cache", 3),
             (c"current-ao", 1),
+            (c"playlist-pos", 4),
         ]
         .into_iter()
         .enumerate()
@@ -374,9 +377,16 @@ mod native {
                                     self.audio_output = Some(name);
                                 }
                             }
+                            (6, 4, true) => {
+                                let value = unsafe { *property.data.cast::<i64>() };
+                                if value >= 0 {
+                                    self.playlist_position = value as usize;
+                                }
+                            }
                             (1, 0, _) => self.position = None,
                             (2, 0, _) => self.duration = None,
                             (5, 0, _) => self.audio_output = None,
+                            (6, 0, _) => self.playlist_position = 0,
                             _ => {}
                         }
                     }
@@ -458,6 +468,16 @@ mod tests {
         state.buffering = false;
         state.paused = true;
         assert_eq!(state.status(), "En pausa");
+    }
+
+    #[test]
+    fn loading_preserves_the_observed_playlist_position() {
+        let mut state = Playback {
+            playlist_position: 2,
+            ..Playback::default()
+        };
+        state.loading();
+        assert_eq!(state.playlist_position, 2);
     }
 
     #[test]

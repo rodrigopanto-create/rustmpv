@@ -591,6 +591,8 @@ def _publish_playlist(media: list[dict], skipped: int, youtube: bool) -> None:
     result = dict(media[0])
     result.update(
         playlist=[item["url"] for item in media[1:]],
+        playlist_extensions=[item.get("extension", "") for item in media[1:]],
+        playlist_protocols=[item.get("protocol", "") for item in media[1:]],
         entry_ids=[item["entry_id"] for item in media],
         used_cookies=_account_downloader is not None,
         playlist_pending=True,
@@ -697,6 +699,8 @@ def _extract_media(
             raise RuntimeError(f"La lista no contiene elementos reproducibles: {_failure_message(_errors.last)}")
         result = media[0]
         result["playlist"] = [item["url"] for item in media[1:]]
+        result["playlist_extensions"] = [item.get("extension", "") for item in media[1:]]
+        result["playlist_protocols"] = [item.get("protocol", "") for item in media[1:]]
         result["entry_ids"] = [item["entry_id"] for item in media]
         result["playlist_notice"] = (
             f"Lista: {len(media)} reproducibles, {skipped} omitidos. "
@@ -718,9 +722,14 @@ def _media_payload(info: object) -> dict:
     requested = info.get("requested_downloads") or []
     if len(requested) > 1:
         raise RuntimeError("yt-dlp devolvio varios streams; se requiere un formato directo")
-    stream_url = requested[0].get("url") if requested else info.get("url")
+    selected = requested[0] if requested else info
+    stream_url = selected.get("url")
+    extension = selected.get("ext") or info.get("ext") or ""
+    protocol = selected.get("protocol") or info.get("protocol") or ""
     return {
         "url": _validate_stream_url(stream_url),
+        "extension": _clean_text(extension).lower(),
+        "protocol": _clean_text(protocol).lower(),
         "title": _clean_text(info.get("title")),
         "artist": _clean_text(info.get("channel") or info.get("uploader")),
         "thumbnails": _thumbnail_candidates(info),

@@ -1,4 +1,4 @@
-use jni::objects::{JObject, JValue};
+use jni::objects::{JObject, JString, JValue};
 use jni::{JavaVM, jni_sig, jni_str};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -100,6 +100,63 @@ pub fn start_playback_service(
             .map_err(|error: jni::errors::Error| error.to_string());
         if sender.send(result).is_err() {
             log::warn!("La interfaz ya no espera el servicio multimedia");
+        }
+    }));
+    receiver
+}
+
+pub fn download_media(
+    app: &AndroidApp,
+    url: String,
+    title: String,
+    extension: String,
+    referer: String,
+    audio_only: bool,
+) -> Receiver<Result<String, String>> {
+    let (sender, receiver) = mpsc::channel();
+    let activity = app.clone();
+    app.run_on_java_main_thread(Box::new(move || {
+        let android = ndk_context::android_context();
+        let vm = unsafe { JavaVM::from_raw(android.vm() as *mut _) };
+        let result = vm
+            .attach_current_thread(|env| {
+                let activity = unsafe { JObject::from_raw(env, activity.activity_as_ptr().cast()) };
+                let result = (|| {
+                    let url = JObject::from(env.new_string(&url)?);
+                    let title = JObject::from(env.new_string(&title)?);
+                    let extension = JObject::from(env.new_string(&extension)?);
+                    let referer = JObject::from(env.new_string(&referer)?);
+                    let value = env
+                        .call_method(
+                            &activity,
+                            jni_str!("enqueueMediaDownload"),
+                            jni_sig!(
+                                "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Z)Ljava/lang/String;"
+                            ),
+                            &[
+                                JValue::Object(&url),
+                                JValue::Object(&title),
+                                JValue::Object(&extension),
+                                JValue::Object(&referer),
+                                JValue::Bool(audio_only),
+                            ],
+                        )?
+                        .l()?;
+                    if value.is_null() {
+                        return Err(jni::errors::Error::NullPtr("enqueueMediaDownload"));
+                    }
+                    let value = unsafe { JString::from_raw(env, value.into_raw()) };
+                    Ok(value.to_string())
+                })();
+                if result.is_err() && env.exception_check() {
+                    env.exception_describe();
+                    env.exception_clear();
+                }
+                result
+            })
+            .map_err(|error: jni::errors::Error| error.to_string());
+        if sender.send(result).is_err() {
+            log::warn!("La interfaz ya no espera el resultado de la descarga");
         }
     }));
     receiver

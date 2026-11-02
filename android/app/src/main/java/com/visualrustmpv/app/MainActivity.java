@@ -1,13 +1,17 @@
 package com.visualrustmpv.app;
 
 import android.app.NativeActivity;
+import android.app.DownloadManager;
+import android.Manifest;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ActivityInfo;
+import android.content.pm.PackageManager;
 import android.graphics.Rect;
 import android.net.Uri;
 import android.os.Build;
+import android.os.Environment;
 import android.security.keystore.KeyGenParameterSpec;
 import android.security.keystore.KeyProperties;
 import android.util.AtomicFile;
@@ -29,6 +33,8 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.security.GeneralSecurityException;
 import java.security.KeyStore;
 import java.util.Arrays;
@@ -41,6 +47,7 @@ import javax.crypto.spec.GCMParameterSpec;
 /** NativeActivity plus a small bridge for the embedded yt-dlp runtime. */
 public final class MainActivity extends NativeActivity {
     private static final int REQUEST_YOUTUBE_COOKIES = 1401;
+    private static final int REQUEST_DOWNLOAD_STORAGE = 1402;
     private static final int MAX_COOKIE_FILE_BYTES = 1024 * 1024;
     private static final String COOKIE_KEY_ALIAS = "visualrustmpv-youtube-cookies-v1";
 
@@ -185,6 +192,88 @@ public final class MainActivity extends NativeActivity {
     /** Resolves the direct stream and lock-screen metadata through the persistent yt-dlp worker. */
     public static String extractMedia(String url, boolean audioOnly) {
         return extractMediaRequest(url, audioOnly, false, false);
+    }
+
+    /** Enqueues a direct HTTP media stream into Android's public Downloads collection. */
+    public String enqueueMediaDownload(String mediaUrl, String title, String extension,
+            String referer, boolean audioOnly) {
+        URI stream;
+        try {
+            stream = new URI(mediaUrl);
+        } catch (URISyntaxException error) {
+            throw new IllegalArgumentException("La URL del stream no es valida", error);
+        }
+        if (!isHttpUri(stream)) {
+            throw new IllegalArgumentException("Solo se pueden descargar streams HTTP(S)");
+        }
+        String normalizedExtension = extension.toLowerCase(Locale.ROOT);
+        String mimeType = downloadMimeType(normalizedExtension, audioOnly);
+        if (mimeType == null) {
+            throw new IllegalArgumentException("Formato de descarga no compatible");
+        }
+        if (Build.VERSION.SDK_INT <= 28
+                && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                        != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(
+                    new String[] {Manifest.permission.WRITE_EXTERNAL_STORAGE},
+                    REQUEST_DOWNLOAD_STORAGE);
+            return "permission-required";
+        }
+        String safeTitle = title.replaceAll("[^\\p{L}\\p{N}._ -]", "_")
+                .replaceAll("^[ .]+|[ .]+$", "");
+        if (safeTitle.isEmpty()) {
+            safeTitle = "VisualRustMPV";
+        }
+        int maxCodePoints = 100;
+        int codePoints = safeTitle.codePointCount(0, safeTitle.length());
+        if (codePoints > maxCodePoints) {
+            safeTitle = safeTitle.substring(0, safeTitle.offsetByCodePoints(0, maxCodePoints));
+        }
+        String filename = safeTitle + "_" + System.currentTimeMillis() + "." + normalizedExtension;
+        DownloadManager manager = getSystemService(DownloadManager.class);
+        if (manager == null) {
+            throw new IllegalStateException("DownloadManager de Android no disponible");
+        }
+        DownloadManager.Request request = new DownloadManager.Request(Uri.parse(mediaUrl))
+                .setTitle(filename)
+                .setDescription("VisualRustMPV")
+                .setMimeType(mimeType)
+                .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                .setAllowedOverRoaming(false)
+                .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, filename);
+        try {
+            URI source = new URI(referer);
+            if (isHttpUri(source)) {
+                request.addRequestHeader("Referer", source.toASCIIString());
+            }
+        } catch (URISyntaxException ignored) {
+            Log.w("VisualRustMPV", "Se omite el Referer no valido para la descarga");
+        }
+        return Long.toString(manager.enqueue(request));
+    }
+
+    private static boolean isHttpUri(URI uri) {
+        return uri.getHost() != null
+                && uri.getUserInfo() == null
+                && ("http".equalsIgnoreCase(uri.getScheme())
+                        || "https".equalsIgnoreCase(uri.getScheme()));
+    }
+
+    private static String downloadMimeType(String extension, boolean audioOnly) {
+        switch (extension) {
+            case "aac": return "audio/aac";
+            case "flac": return "audio/flac";
+            case "m4a": return "audio/mp4";
+            case "mkv": return "video/x-matroska";
+            case "mov": return "video/quicktime";
+            case "mp3": return "audio/mpeg";
+            case "mp4": return "video/mp4";
+            case "ogg": return "audio/ogg";
+            case "opus": return "audio/ogg";
+            case "ts": return "video/mp2t";
+            case "webm": return audioOnly ? "audio/webm" : "video/webm";
+            default: return null;
+        }
     }
 
     public static String retryMediaPlayback(String url, boolean audioOnly, boolean cookiesOnly) {

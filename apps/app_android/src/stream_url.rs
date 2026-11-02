@@ -7,10 +7,14 @@ const THUMBNAIL_LIMIT: usize = 3;
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MediaInfo {
     pub url: String,
+    pub extension: String,
+    pub protocol: String,
     pub title: String,
     pub artist: String,
     pub thumbnails: Vec<String>,
     pub playlist: Vec<String>,
+    pub playlist_extensions: Vec<String>,
+    pub playlist_protocols: Vec<String>,
     pub used_cookies: bool,
     pub entry_ids: Vec<String>,
     pub playlist_notice: String,
@@ -22,6 +26,10 @@ pub struct MediaInfo {
 struct RawMedia {
     url: String,
     #[serde(default)]
+    extension: String,
+    #[serde(default)]
+    protocol: String,
+    #[serde(default)]
     title: String,
     #[serde(default)]
     artist: String,
@@ -29,6 +37,10 @@ struct RawMedia {
     thumbnails: Vec<String>,
     #[serde(default)]
     playlist: Vec<String>,
+    #[serde(default)]
+    playlist_extensions: Vec<String>,
+    #[serde(default)]
+    playlist_protocols: Vec<String>,
     #[serde(default)]
     used_cookies: bool,
     #[serde(default)]
@@ -76,12 +88,26 @@ impl MediaInfo {
             .as_ref()
             .and_then(|url| url.host_str().map(str::to_owned))
             .unwrap_or_default();
+        let extension = parsed
+            .as_ref()
+            .and_then(|url| url.path_segments()?.next_back())
+            .and_then(|name| name.rsplit_once('.').map(|(_, extension)| extension))
+            .map(normalize_extension)
+            .unwrap_or_default();
+        let protocol = parsed
+            .as_ref()
+            .map(|url| url.scheme().to_owned())
+            .unwrap_or_default();
         Self {
             url,
+            extension,
+            protocol,
             title: clean_text(&file),
             artist: clean_text(&host),
             thumbnails: Vec::new(),
             playlist: Vec::new(),
+            playlist_extensions: Vec::new(),
+            playlist_protocols: Vec::new(),
             used_cookies: false,
             entry_ids: Vec::new(),
             playlist_notice: String::new(),
@@ -113,6 +139,22 @@ impl MediaInfo {
             .into_iter()
             .map(|url| validate_stream_url(&url))
             .collect::<Result<Vec<_>, _>>()?;
+        if (!raw.playlist_extensions.is_empty() && raw.playlist_extensions.len() != playlist.len())
+            || (!raw.playlist_protocols.is_empty()
+                && raw.playlist_protocols.len() != playlist.len())
+        {
+            return Err("Metadatos de descarga no corresponden a sus streams".to_owned());
+        }
+        let playlist_extensions = raw
+            .playlist_extensions
+            .into_iter()
+            .map(|extension| normalize_extension(&extension))
+            .collect();
+        let playlist_protocols = raw
+            .playlist_protocols
+            .into_iter()
+            .map(|protocol| normalize_protocol(&protocol))
+            .collect();
         let thumbnails = raw
             .thumbnails
             .iter()
@@ -122,15 +164,78 @@ impl MediaInfo {
             .collect();
         Ok(Self {
             url: validate_stream_url(&raw.url)?,
+            extension: normalize_extension(&raw.extension),
+            protocol: normalize_protocol(&raw.protocol),
             title: clean_text(&raw.title),
             artist: clean_text(&raw.artist),
             thumbnails,
             playlist,
+            playlist_extensions,
+            playlist_protocols,
             used_cookies: raw.used_cookies,
             entry_ids,
             playlist_notice: clean_text(&raw.playlist_notice),
             playlist_pending: raw.playlist_pending,
         })
+    }
+
+    pub fn download_target(&self, playlist_position: usize) -> Result<DownloadTarget, String> {
+        let (url, extension, protocol) = if playlist_position == 0 {
+            (&self.url, &self.extension, &self.protocol)
+        } else {
+            let index = playlist_position - 1;
+            (
+                self.playlist
+                    .get(index)
+                    .ok_or_else(|| "No se encontro el medio actual en la lista".to_owned())?,
+                self.playlist_extensions.get(index).ok_or_else(|| {
+                    "yt-dlp no informo el formato descargable del medio actual".to_owned()
+                })?,
+                self.playlist_protocols
+                    .get(index)
+                    .ok_or_else(|| "yt-dlp no informo el protocolo del medio actual".to_owned())?,
+            )
+        };
+        let allowed_extension = matches!(
+            extension.as_str(),
+            "aac" | "flac" | "m4a" | "mkv" | "mov" | "mp3" | "mp4" | "ogg" | "opus" | "ts" | "webm"
+        );
+        if !allowed_extension || !matches!(protocol.as_str(), "http" | "https") {
+            return Err("Este medio no es un archivo HTTP directo descargable".to_owned());
+        }
+        let title = if playlist_position == 0 || self.title.is_empty() {
+            self.title.clone()
+        } else {
+            format!("{} - {}", self.title, playlist_position + 1)
+        };
+        Ok(DownloadTarget {
+            url: url.clone(),
+            title,
+            extension: extension.clone(),
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct DownloadTarget {
+    pub url: String,
+    pub title: String,
+    pub extension: String,
+}
+
+fn normalize_extension(extension: &str) -> String {
+    let extension = extension.to_ascii_lowercase();
+    if extension.len() <= 8 && extension.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        extension
+    } else {
+        String::new()
+    }
+}
+
+fn normalize_protocol(protocol: &str) -> String {
+    match protocol.to_ascii_lowercase().as_str() {
+        "http" | "https" => protocol.to_ascii_lowercase(),
+        _ => String::new(),
     }
 }
 
@@ -261,6 +366,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(media.url, "https://cdn.example/a");
+        assert_eq!(media.extension, "");
+        assert_eq!(media.protocol, "");
         assert_eq!(media.title, "Big Buck Bunny");
         assert_eq!(media.artist, "Blender");
         assert_eq!(
@@ -301,8 +408,41 @@ mod tests {
         let media = MediaInfo::direct("https://media.example/path/My%20Song+1.mp3?x=1".to_owned());
         assert_eq!(media.title, "My Song+1.mp3");
         assert_eq!(media.artist, "media.example");
+        assert_eq!(media.extension, "mp3");
+        assert_eq!(media.protocol, "https");
         assert!(media.thumbnails.is_empty());
         assert!(media.playlist.is_empty());
+    }
+
+    #[test]
+    fn download_target_uses_the_current_playlist_stream_and_rejects_manifests() {
+        let media = MediaInfo::from_json(
+            r#"{"url":"https://cdn.example/a","extension":"mp4","protocol":"https",
+                "title":"Video","playlist":["https://cdn.example/b"],
+                "playlist_extensions":["webm"],"playlist_protocols":["http"]}"#,
+        )
+        .unwrap();
+        let target = media.download_target(1).unwrap();
+        assert_eq!(target.url, "https://cdn.example/b");
+        assert_eq!(target.title, "Video - 2");
+        assert_eq!(target.extension, "webm");
+        assert_eq!(
+            media.download_target(2).unwrap_err(),
+            "No se encontro el medio actual en la lista"
+        );
+        let manifest = MediaInfo::from_json(
+            r#"{"url":"https://cdn.example/list.m3u8","extension":"mp4",
+                "protocol":"m3u8_native"}"#,
+        )
+        .unwrap();
+        assert!(manifest.download_target(0).is_err());
+        assert!(
+            MediaInfo::from_json(
+                r#"{"url":"https://cdn.example/a","playlist":["https://cdn.example/b"],
+                "playlist_extensions":["mp4","webm"]}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]

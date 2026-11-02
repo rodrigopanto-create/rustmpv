@@ -182,6 +182,7 @@ impl Session {
                 });
             match result {
                 Ok(media) => {
+                    playback.playlist_position = 0;
                     playback.loading();
                     playback.paused = request.paused;
                     self.media = media.clone();
@@ -316,6 +317,14 @@ impl Request {
             }
             media.url = media.playlist[index - 1].clone();
             media.playlist.drain(..index);
+            if !media.playlist_extensions.is_empty() {
+                media.extension = media.playlist_extensions.remove(index - 1);
+                media.playlist_extensions.drain(..index - 1);
+            }
+            if !media.playlist_protocols.is_empty() {
+                media.protocol = media.playlist_protocols.remove(index - 1);
+                media.playlist_protocols.drain(..index - 1);
+            }
             media.entry_ids.drain(..index);
         }
         Ok(media)
@@ -710,16 +719,24 @@ mod tests {
         assert!(request.paused);
         let refreshed = MediaInfo {
             url: "https://cdn.example/x".into(),
+            extension: "mp4".into(),
+            protocol: "https".into(),
             playlist: vec![
                 "https://cdn.example/b".into(),
                 "https://cdn.example/c".into(),
             ],
+            playlist_extensions: vec!["m4a".into(), "webm".into()],
+            playlist_protocols: vec!["https".into(), "http".into()],
             entry_ids: vec!["x".into(), "b".into(), "c".into()],
             ..MediaInfo::default()
         };
         let selected = request.select(refreshed).unwrap();
         assert_eq!(selected.url, "https://cdn.example/b");
+        assert_eq!(selected.extension, "m4a");
+        assert_eq!(selected.protocol, "https");
         assert_eq!(selected.playlist, vec!["https://cdn.example/c"]);
+        assert_eq!(selected.playlist_extensions, vec!["webm"]);
+        assert_eq!(selected.playlist_protocols, vec!["http"]);
         assert_eq!(selected.entry_ids, vec!["b", "c"]);
         assert!(request.select(MediaInfo::default()).is_err());
     }
