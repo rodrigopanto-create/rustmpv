@@ -159,6 +159,27 @@ struct AndroidAppState {
 
 #[cfg(target_os = "android")]
 impl AndroidAppState {
+    fn apply_window_insets(&self, context: &egui::Context, frame: &mut egui::Frame) {
+        if let Some(window) = self.android_app.native_window() {
+            let content = self.android_app.content_rect();
+            let margins = system_bar_margins(
+                [content.left, content.top, content.right, content.bottom],
+                [window.width(), window.height()],
+                context.pixels_per_point(),
+            );
+            frame.inner_margin.left += margins.left;
+            frame.inner_margin.top += margins.top;
+            frame.inner_margin.right += margins.right;
+            frame.inner_margin.bottom += margins.bottom;
+            if let Some(bottom) = screen::visible_bottom() {
+                frame.inner_margin.bottom = frame
+                    .inner_margin
+                    .bottom
+                    .max((window.height() - bottom).max(0) as f32 / context.pixels_per_point());
+            }
+        }
+    }
+
     fn update_session_choice(&mut self) {
         if self.session_input != self.url.trim() {
             #[cfg(feature = "chaquopy")]
@@ -360,6 +381,38 @@ fn startup_splash_visible(
     elapsed < STARTUP_SPLASH_MINIMUM || (warmup_pending && elapsed < STARTUP_SPLASH_MAXIMUM)
 }
 
+#[cfg(any(all(target_os = "android", feature = "chaquopy"), test))]
+fn draw_startup_splash(context: &egui::Context, mut frame: egui::Frame) -> egui::Rect {
+    frame.fill = egui::Color32::from_rgb(12, 18, 30);
+    egui::CentralPanel::default()
+        .frame(frame)
+        .show(context, |ui| {
+            let content = ui.available_rect_before_wrap();
+            let block = egui::Rect::from_center_size(
+                content.center(),
+                egui::vec2(content.width(), content.height().min(150.0)),
+            );
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(block), |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.heading(
+                        egui::RichText::new("VisualRustMPV")
+                            .size(32.0)
+                            .strong()
+                            .color(egui::Color32::from_rgb(113, 190, 255)),
+                    );
+                    ui.add_space(16.0);
+                    ui.add(egui::Spinner::new().size(28.0));
+                    ui.add_space(12.0);
+                    ui.label("Preparando el motor multimedia...");
+                })
+                .response
+                .rect
+            })
+            .inner
+        })
+        .inner
+}
+
 #[cfg(target_os = "android")]
 impl eframe::App for AndroidAppState {
     /// Dibuja la interfaz Android y expone el formato directo elegido.
@@ -417,28 +470,8 @@ impl eframe::App for AndroidAppState {
             }
             if splash_visible {
                 let mut splash_frame = egui::Frame::central_panel(&context.style());
-                splash_frame.fill = egui::Color32::from_rgb(12, 18, 30);
-                egui::CentralPanel::default()
-                    .frame(splash_frame)
-                    .show(context, |ui| {
-                        ui.with_layout(
-                            egui::Layout::centered_and_justified(egui::Direction::TopDown),
-                            |ui| {
-                                ui.vertical_centered(|ui| {
-                                    ui.heading(
-                                        egui::RichText::new("VisualRustMPV")
-                                            .size(32.0)
-                                            .strong()
-                                            .color(egui::Color32::from_rgb(113, 190, 255)),
-                                    );
-                                    ui.add_space(16.0);
-                                    ui.add(egui::Spinner::new().size(28.0));
-                                    ui.add_space(12.0);
-                                    ui.label("Preparando el motor multimedia...");
-                                });
-                            },
-                        );
-                    });
+                self.apply_window_insets(context, &mut splash_frame);
+                draw_startup_splash(context, splash_frame);
                 return;
             }
         }
@@ -550,24 +583,7 @@ impl eframe::App for AndroidAppState {
             frame.inner_margin = egui::Margin::default();
             frame.fill = egui::Color32::BLACK;
         }
-        if let Some(window) = self.android_app.native_window() {
-            let content = self.android_app.content_rect();
-            let margins = system_bar_margins(
-                [content.left, content.top, content.right, content.bottom],
-                [window.width(), window.height()],
-                context.pixels_per_point(),
-            );
-            frame.inner_margin.left += margins.left;
-            frame.inner_margin.top += margins.top;
-            frame.inner_margin.right += margins.right;
-            frame.inner_margin.bottom += margins.bottom;
-            if let Some(bottom) = screen::visible_bottom() {
-                frame.inner_margin.bottom = frame
-                    .inner_margin
-                    .bottom
-                    .max((window.height() - bottom).max(0) as f32 / context.pixels_per_point());
-            }
-        }
+        self.apply_window_insets(context, &mut frame);
         egui::CentralPanel::default()
             .frame(frame)
             .show(context, |ui| {
@@ -681,7 +697,9 @@ impl eframe::App for AndroidAppState {
                             self.last_resolved_at = None;
                         }
                         if self.youtube_session {
-                            ui.weak("Sesion necesaria para conservar tus mixes y listas personales. Importa cookies de tu cuenta.");
+                            ui.weak("Modo cuenta: exige una sesion aceptada por YouTube; no cambia a un mix anonimo si falla.");
+                        } else {
+                            ui.weak("Los radios publicos no necesitan cuenta. Activa la sesion solo si quieres usar tu cuenta y sus recomendaciones.");
                         }
                         ui.weak("Listas: hasta 100 elementos por carga; los no disponibles se indican y se omiten.");
                     }
@@ -1036,6 +1054,16 @@ impl AndroidAppState {
         let can_play = !self.resolving();
         #[cfg(feature = "chaquopy")]
         let can_play = can_play && (!lifecycle::queue_pending() || playback.active);
+        if button(
+            ui,
+            Icon::Previous,
+            "Anterior en la lista",
+            playback.can_navigate(false),
+        )
+        .clicked()
+        {
+            self.navigate_playlist(false);
+        }
         if button(ui, Icon::Play, "Reproducir / Reanudar", can_play).clicked() {
             let same_media = self
                 .last_media
@@ -1067,6 +1095,16 @@ impl AndroidAppState {
         .clicked()
         {
             self.cancel_process();
+        }
+        if button(
+            ui,
+            Icon::Next,
+            "Siguiente en la lista",
+            playback.can_navigate(true),
+        )
+        .clicked()
+        {
+            self.navigate_playlist(true);
         }
         if button(
             ui,
@@ -1241,6 +1279,17 @@ impl AndroidAppState {
                     },
                 )),
             });
+        }
+    }
+
+    fn navigate_playlist(&mut self, next: bool) {
+        match lifecycle::navigate_playlist(next) {
+            Ok(()) => self.seek_position = None,
+            Err(error) => {
+                log::error!("Cambiar elemento de la lista: {error}");
+                self.status = error.clone();
+                self.process_message(error);
+            }
         }
     }
 
@@ -2357,8 +2406,9 @@ pub fn desktop_placeholder() -> &'static str {
 #[cfg(test)]
 mod layout_tests {
     use super::{
-        MediaSite, STARTUP_SPLASH_MAXIMUM, STARTUP_SPLASH_MINIMUM, is_youtube_playlist_url,
-        media_site, startup_splash_visible, system_bar_margins, user_facing_error,
+        MediaSite, STARTUP_SPLASH_MAXIMUM, STARTUP_SPLASH_MINIMUM, draw_startup_splash,
+        is_youtube_playlist_url, media_site, startup_splash_visible, system_bar_margins,
+        user_facing_error,
     };
     use eframe::egui;
 
@@ -2384,6 +2434,43 @@ mod layout_tests {
         assert_eq!(margins.bottom, 48.0);
         assert_eq!(margins.left, 0.0);
         assert_eq!(margins.right, 0.0);
+    }
+
+    #[test]
+    fn splash_content_is_centered_inside_system_bars() {
+        for (window, content, scale) in [
+            ([1080, 2340], [0, 90, 1080, 2208], 3.0),
+            ([2340, 1080], [90, 0, 2208, 1020], 3.0),
+            ([720, 1600], [0, 48, 720, 1504], 2.0),
+        ] {
+            let context = egui::Context::default();
+            let screen = egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(window[0] as f32 / scale, window[1] as f32 / scale),
+            );
+            let margins = system_bar_margins(content, window, scale);
+            let safe_area = egui::Rect::from_min_max(
+                screen.min + egui::vec2(margins.left, margins.top),
+                screen.max - egui::vec2(margins.right, margins.bottom),
+            );
+            let _ = context.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |context| {
+                    let mut frame = egui::Frame::central_panel(&context.style());
+                    frame.inner_margin.left += margins.left;
+                    frame.inner_margin.top += margins.top;
+                    frame.inner_margin.right += margins.right;
+                    frame.inner_margin.bottom += margins.bottom;
+                    let block = draw_startup_splash(context, frame);
+                    assert!(safe_area.contains_rect(block), "{block:?} in {safe_area:?}");
+                    assert!((block.center().x - safe_area.center().x).abs() < 1.0);
+                    assert!((block.center().y - safe_area.center().y).abs() < 30.0);
+                },
+            );
+        }
     }
 
     #[test]

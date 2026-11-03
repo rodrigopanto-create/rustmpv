@@ -21,8 +21,12 @@ pub fn playlist_id(input: &str) -> Option<String> {
 }
 
 pub fn personalized(input: &str) -> bool {
-    playlist_id(input)
-        .is_some_and(|id| id.starts_with("RD") || matches!(id.as_str(), "WL" | "LL" | "LM"))
+    playlist_id(input).is_some_and(|id| {
+        let public_radio = ["RDAMVM", "RD"]
+            .iter()
+            .any(|prefix| id.strip_prefix(prefix).is_some_and(|seed| seed.len() == 11));
+        (id.starts_with("RD") && !public_radio) || matches!(id.as_str(), "WL" | "LL" | "LM")
+    })
 }
 
 pub fn collection(input: &str) -> bool {
@@ -41,8 +45,8 @@ mod tests {
     #[test]
     fn detects_music_playlists_and_personal_mixes_without_matching_other_hosts() {
         for input in [
-            "https://music.youtube.com/watch?v=abcdefghijk&list=RDAMVMabcdefghijk",
             "https://www.youtube.com/playlist?list=WL",
+            "https://www.youtube.com/playlist?list=LL",
             "https://music.youtube.com/playlist?list=LM",
             "https://youtu.be/abcdefghijk?list=RDMM",
             "https://music.youtube.com/browse/VLRDTMAK123",
@@ -50,6 +54,9 @@ mod tests {
             assert!(personalized(input), "{input}");
         }
         for input in [
+            "https://youtube.com/playlist?list=RD3LXr89pMU2Q&playnext=1&si=shared",
+            "https://music.youtube.com/watch?v=abcdefghijk&list=RDAMVMabcdefghijk",
+            "https://youtu.be/abcdefghijk?list=RDabcdefghijk&index=3",
             "https://music.youtube.com/playlist?list=PL123",
             "https://music.youtube.com/browse/MPREb123",
             "https://youtube.com/watch?v=abcdefghijk",
@@ -70,5 +77,20 @@ mod tests {
             playlist_id("https://youtube.com/playlist?list=RD%0Asecret"),
             None
         );
+    }
+
+    #[test]
+    fn public_radios_remain_collections_without_requiring_account_mode() {
+        for prefix in ["RD", "RDAMVM"] {
+            for seed in ["3LXr89pMU2Q", "abcde-gh_12"] {
+                let input = format!("https://youtube.com/playlist?list={prefix}{seed}");
+                assert!(collection(&input), "{input}");
+                assert!(!personalized(&input), "{input}");
+            }
+        }
+        for id in ["RDMM", "RDTMAK123", "RDabcdefghij", "RDabcdefghijkl"] {
+            let input = format!("https://music.youtube.com/playlist?list={id}");
+            assert!(personalized(&input), "{input}");
+        }
     }
 }

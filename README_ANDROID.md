@@ -62,6 +62,8 @@ On launch, a short splash screen covers the player controls while the Python
 worker initializes; it disappears when yt-dlp is ready, with an eight-second
 maximum so a slow warm-up cannot block the app. YouTube-player cache warming
 continues in the background after the player screen appears.
+The splash shares the player's system-bar insets and centers its content inside
+the usable window, clear of the status and navigation bars.
 
 ### Persistent Python worker
 
@@ -104,6 +106,12 @@ keyboard's visible window boundary reserved so history cannot paint over them.
 `Downloads` folder through `DownloadManager`; Android owns background progress
 and its completion notification. The button is enabled only for recognized
 single-file HTTP(S) formats, not HLS/DASH manifests.
+**Anterior** and **Siguiente** move between ready playlist items without
+restarting extraction or cancelling the progressive queue. They preserve Pause,
+do not wrap at the ends, and stay disabled while switching/loading/recovering.
+Siguiente becomes available when the worker appends another item. Android's
+media notification, lock-screen session and headset skip commands use the same
+navigation and boundary checks; individual-media playback has no skip actions.
 
 Important resolver stages remain in Android logs and the bounded **Consola del
 proceso** panel: guest preparation, site/format requests, JavaScript/PO Token work,
@@ -238,19 +246,26 @@ index and sharing parameters are preserved. Other personal list IDs are not
 guessed or replaced.
 
 **Usar mi sesion de YouTube / Music** selects account-only extraction from the
-start. It defaults ON for `RD...` mixes/radios (including Music mixes), Watch
-Later (`WL`), liked videos (`LL`) and Music likes (`LM`). You can override it,
+start. Seeded public radios (`RD` or `RDAMVM` plus an 11-character video ID)
+default OFF: they can play without proving account authentication, like mpv's
+normal public playback. The selector still defaults ON for other `RD...`
+personal mixes, Watch Later (`WL`), liked videos (`LL`) and Music likes (`LM`). You can override it,
 or enable it for other personal/private lists. Defaults are recalculated when
 the input URL changes. Import current Netscape cookies from the intended account;
 the app cannot infer a session from the YouTube/Music app installed on the phone.
 Missing or rejected cookies produce an error, never a successful anonymous
 replacement for a requested personal list. Turning the selector OFF deliberately
 uses the normal anonymous-first fallback instead.
+Public playback is not evidence that account authentication or personalized
+recommendations work. Selecting account mode explicitly keeps strict session
+checks even on a public radio; a rejected session never silently becomes a guest mix.
 Session mode checks yt-dlp's YouTube authentication-cookie state before and after
 extraction and rejects its expired/rotated-cookie warning. This detects missing
 or lost authentication; it does not certify account entitlements or access.
 If the playlist response already reports invalid authentication, it fails before
 enumerating or resolving its tracks, rather than spending minutes on a lost session.
+The UI reports this authentication rejection explicitly; it does not infer that
+the export is old or promise that repeatedly importing it will restore access.
 
 The session choice is part of the prefetch/cache identity. Account playlist
 streams retain account-only playback recovery, so a failed item cannot silently
@@ -347,7 +362,7 @@ With JDK/SDK configured and an unlocked phone permitting USB installation:
 .\android\gradlew.bat -p android :app:assembleDebugAndroidTest --no-daemon --max-workers=2
 adb install -r android\app\build\outputs\apk\debug\app-debug.apk
 adb install -r android\app\build\outputs\apk\androidTest\debug\app-debug-androidTest.apk
-adb shell am instrument -w -e pasteX 660 -e pasteY 155 -e playX 55 -e playY 1395 com.visualrustmpv.app.test/com.visualrustmpv.app.PlaybackRecoveryInstrumentation
+adb shell am instrument -w -e pasteX 660 -e pasteY 155 -e playX 145 -e playY 1395 com.visualrustmpv.app.test/com.visualrustmpv.app.PlaybackRecoveryInstrumentation
 adb uninstall com.visualrustmpv.app.test
 ```
 
@@ -362,7 +377,7 @@ to the instrumentation command; for foreground only, use
 `-e scenarios guest,cookies,cancel,exhaust`. Selected runs print `PASS:` followed
 by the selected names. Inspect this output, not just adb's exit code.
 The focused stuck-extractor test uses `-e scenarios resolve_cancel` plus
-`-e cancelX 230 -e cancelY 1395` for the OPPO's Stop button. It starts an infinite
+`-e cancelX 320 -e cancelY 1395` for the OPPO's Stop button. It starts an infinite
 Python loop, cancels via the actual player control, then pastes and plays a
 different URL using the same serial worker. It is opt-in rather than part of the
 default suite because it requires the additional Cancel coordinates.
@@ -380,13 +395,50 @@ The next track arrives after the first reaches EOF; foreground and screen-off
 cases must resume it automatically. Stop must interrupt the unfinished queue
 without serving the second item. These checks use only localhost streams and
 synthetic cookies.
+Playlist navigation is opt-in with `-e scenarios playlist_navigation` plus
+`-e nextX ... -e nextY ... -e previousX ... -e previousY ...`. The localhost
+three-item fixture checks both UI buttons, notification Next, disabled end
+boundaries, Pause/Resume and that navigation never restarts extraction.
+The existing Play coordinate now targets the second button, after Anterior.
+Verified on the Redmi Note 8 Pro: `PASS: playlist_navigation` covered both UI
+buttons, notification Next, playlist boundaries and Pause/Resume with a single
+extraction. `guest,progressive_guest,music_radio_screenshot` also printed `PASS:`
+on the same APK. Host checks passed 76 Android Rust and 94 Python tests.
 Real Redmi radio checks use `-e scenarios music_radio,music_radio_second`,
-plus `-e sessionX 42 -e sessionY 306` to explicitly turn off account mode for
-these public comparisons (adjust coordinates on other devices). Both screenshot
+or `-e scenarios music_radio_screenshot` for the latest Termux comparison
+(`RD3LXr89pMU2Q`). These seeded radios must default to guest mode without
+toggling the account selector. Both earlier screenshot
 mixes, `RDUsR08cY8k0A` and `RD98WtmW-lfeE`, were verified with advancing libmpv
 playback while the remaining queue was still resolving. These checks never
 open saved cookies; they do not certify personalized recommendations. Stored
-YouTube cookies on the Redmi were rejected as rotated and need reimporting.
+YouTube cookies on the Redmi produced yt-dlp's rotated-cookie warning.
+`-e scenarios music_account -e sessionX 42 -e sessionY 247` explicitly enables
+account mode for the latest screenshot radio (adjust coordinates to the device).
+Unlike the synthetic scenarios, this opt-in test opens the owner's saved cookies
+and requires their authorization. It limits extraction to two entries and never
+retries anonymously; authentication
+rejection fails the test and reports only a boolean, not cookie values. Playback
+alone does not certify that the returned recommendations match the owner's account.
+`music_account_auth` first checks the same saved jar with a normal yt-dlp
+YouTube library-page request, without the app's extraction options, on the same
+serial worker. It reports only authentication-cookie presence before/after and
+the server's `LOGGED_IN` boolean, then attempts account playback only if accepted.
+On the OPPO, the latest screenshot radio passed public playback with this build.
+The owner then imported newly exported cookies: both strict account playback and
+the baseline check failed. The baseline had authentication cookies before the
+request, but YouTube returned `LOGGED_IN=false` and removed authentication.
+The temporary jars were deleted. Account playback/personalization is therefore
+**not verified or fixed** by the public-radio correction.
+The updated APK was also tested on the Redmi Note 8 Pro on 2026-11-02:
+`music_radio_screenshot,music_session,progressive_session` printed `PASS:`.
+The exact screenshot radio started publicly while its queue was still resolving,
+with playback reaching 2000 ms. Both real-cookie cases (`music_account` and
+`music_account_auth`) failed: the baseline had authentication before the request,
+but returned `LOGGED_IN=false` and lost authentication afterward. Temporary jars
+were deleted; the test APK was removed without clearing the app's saved cookies.
+For this Redmi's 1080 x 2340 layout, use `pasteX=915`, `pasteY=190`,
+`playX=200`, `playY=2045`, `sessionX=42`, `sessionY=306`.
+Navigation uses `previousX=80`, `nextX=565`, and `previousY=nextY=2045`.
 The same Redmi build also passed `music_public` and nine selected recovery,
 progressive-queue, cancellation and screen-off scenarios.
 Success prints `PASS: foreground and screen-off renewal, cookie retry, pause, Stop, bounded exhaustion`.

@@ -14,6 +14,7 @@ pub struct Playback {
     pub diagnostic: Option<String>,
     pub stream_failure: bool,
     pub playlist_position: usize,
+    pub playlist_count: usize,
     pub last_position: Option<f64>,
     pub cancel_generation: u64,
     pub recovering: bool,
@@ -33,7 +34,24 @@ impl Playback {
                 | (i64::from(self.loaded) << 2)
                 | (i64::from(self.buffering) << 3)
                 | (i64::from(self.error.is_some()) << 4)
+                | (i64::from(self.can_navigate(false)) << 6)
+                | (i64::from(self.can_navigate(true)) << 7)
         }
+    }
+
+    pub fn can_navigate(&self, next: bool) -> bool {
+        self.active
+            && self.loaded
+            && !self.stopped
+            && !self.ended
+            && !self.recovering
+            && self.error.is_none()
+            && self.playlist_position < self.playlist_count
+            && if next {
+                self.playlist_position + 1 < self.playlist_count
+            } else {
+                self.playlist_position > 0
+            }
     }
 
     pub fn is_playing(&self) -> bool {
@@ -54,6 +72,7 @@ impl Playback {
             paused: self.paused,
             audio_output: self.audio_output.take(),
             playlist_position,
+            playlist_count: self.playlist_count,
             cancel_generation: self.cancel_generation,
             load_generation: self.load_generation.wrapping_add(1),
             ..Self::default()
@@ -215,6 +234,7 @@ mod native {
             (c"paused-for-cache", 3),
             (c"current-ao", 1),
             (c"playlist-pos", 4),
+            (c"playlist-count", 4),
         ]
         .into_iter()
         .enumerate()
@@ -383,10 +403,15 @@ mod native {
                                     self.playlist_position = value as usize;
                                 }
                             }
+                            (7, 4, true) => {
+                                self.playlist_count =
+                                    unsafe { *property.data.cast::<i64>() }.max(0) as usize;
+                            }
                             (1, 0, _) => self.position = None,
                             (2, 0, _) => self.duration = None,
                             (5, 0, _) => self.audio_output = None,
                             (6, 0, _) => self.playlist_position = 0,
+                            (7, 0, _) => self.playlist_count = 0,
                             _ => {}
                         }
                     }
@@ -407,6 +432,60 @@ pub use native::{error_text, subscribe};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playlist_navigation_respects_boundaries_and_ready_entries() {
+        let mut playback = Playback {
+            active: true,
+            loaded: true,
+            playlist_count: 1,
+            ..Playback::default()
+        };
+        assert!(!playback.can_navigate(false));
+        assert!(!playback.can_navigate(true));
+        playback.playlist_count = 3;
+        assert!(!playback.can_navigate(false));
+        assert!(playback.can_navigate(true));
+        assert_eq!(playback.service_flags() & 192, 128);
+        playback.playlist_position = 1;
+        assert!(playback.can_navigate(false));
+        assert!(playback.can_navigate(true));
+        assert_eq!(playback.service_flags() & 192, 192);
+        playback.playlist_position = 2;
+        assert!(playback.can_navigate(false));
+        assert!(!playback.can_navigate(true));
+        playback.playlist_position = usize::MAX;
+        assert!(!playback.can_navigate(false));
+        assert!(!playback.can_navigate(true));
+    }
+
+    #[test]
+    fn navigation_is_disabled_during_loading_recovery_and_after_stop_or_error() {
+        let ready = Playback {
+            active: true,
+            loaded: true,
+            paused: true,
+            playlist_position: 1,
+            playlist_count: 3,
+            ..Playback::default()
+        };
+        assert!(ready.can_navigate(false));
+        assert!(ready.can_navigate(true));
+        for state in 0..5 {
+            let mut playback = ready.clone();
+            match state {
+                0 => playback.loading(),
+                1 => playback.recovering = true,
+                2 => playback.cancel(),
+                3 => playback.fail("test".to_owned()),
+                _ => playback.ended = true,
+            }
+            assert!(!playback.can_navigate(false));
+            assert!(!playback.can_navigate(true));
+            assert_eq!(playback.service_flags() & 192, 0);
+            assert_eq!(playback.playlist_count, 3);
+        }
+    }
 
     #[test]
     fn pending_renewal_retains_service_until_stop_or_terminal_failure() {

@@ -41,6 +41,8 @@ public final class PlaybackService extends Service {
     private static final String PLAY = "com.visualrustmpv.app.PLAY";
     private static final String PAUSE = "com.visualrustmpv.app.PAUSE";
     private static final String STOP = "com.visualrustmpv.app.STOP";
+    private static final String PREVIOUS = "com.visualrustmpv.app.PREVIOUS";
+    private static final String NEXT = "com.visualrustmpv.app.NEXT";
     static final String EXTRA_TITLE = "com.visualrustmpv.app.TITLE";
     static final String EXTRA_ARTIST = "com.visualrustmpv.app.ARTIST";
     static final String EXTRA_THUMBNAILS = "com.visualrustmpv.app.THUMBNAILS";
@@ -127,6 +129,10 @@ public final class PlaybackService extends Service {
             public void onPause() { control(1); }
             @Override
             public void onStop() { control(2); }
+            @Override
+            public void onSkipToPrevious() { control(3); }
+            @Override
+            public void onSkipToNext() { control(4); }
         }, handler);
         session.setActive(true);
         if (Build.VERSION.SDK_INT >= 26) {
@@ -171,6 +177,10 @@ public final class PlaybackService extends Service {
             control(1);
         } else if (PLAY.equals(action)) {
             control(0);
+        } else if (PREVIOUS.equals(action)) {
+            control(3);
+        } else if (NEXT.equals(action)) {
+            control(4);
         }
         handler.removeCallbacks(ticker);
         handler.post(ticker);
@@ -324,9 +334,12 @@ public final class PlaybackService extends Service {
                 : paused ? PlaybackState.STATE_PAUSED
                 : (flags & 4) == 0 || (flags & 8) != 0 ? PlaybackState.STATE_BUFFERING
                 : PlaybackState.STATE_PLAYING;
+        long actions = PlaybackState.ACTION_PLAY | PlaybackState.ACTION_PAUSE
+                | PlaybackState.ACTION_PLAY_PAUSE | PlaybackState.ACTION_STOP;
+        if ((flags & 64) != 0) actions |= PlaybackState.ACTION_SKIP_TO_PREVIOUS;
+        if ((flags & 128) != 0) actions |= PlaybackState.ACTION_SKIP_TO_NEXT;
         session.setPlaybackState(new PlaybackState.Builder()
-                .setActions(PlaybackState.ACTION_PLAY | PlaybackState.ACTION_PAUSE
-                        | PlaybackState.ACTION_PLAY_PAUSE | PlaybackState.ACTION_STOP)
+                .setActions(actions)
                 .setState(state, nativePosition(), state == PlaybackState.STATE_PLAYING ? 1f : 0f)
                 .build());
         long duration = nativeDuration();
@@ -366,7 +379,7 @@ public final class PlaybackService extends Service {
                 ? new Notification.Builder(this, CHANNEL) : new Notification.Builder(this);
         String state = (flags & 32) != 0 ? "Renovando enlace..."
                 : paused ? "En pausa" : (flags & 4) == 0 ? "Cargando..." : "Reproduciendo";
-        return builder.setContentTitle(title)
+        builder.setContentTitle(title)
                 .setContentText(artist.isEmpty() ? state : artist)
                 .setSubText(state)
                 .setLargeIcon(artwork)
@@ -375,12 +388,24 @@ public final class PlaybackService extends Service {
                 .setVisibility(Notification.VISIBILITY_PUBLIC)
                 .setOnlyAlertOnce(true)
                 .setOngoing(!paused)
-                .setDeleteIntent(action(STOP, 3))
-                .addAction(paused ? android.R.drawable.ic_media_play : android.R.drawable.ic_media_pause,
-                        paused ? "Reanudar" : "Pausar", action(paused ? PLAY : PAUSE, 1))
-                .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Detener", action(STOP, 2))
+                .setDeleteIntent(action(STOP, 3));
+        int count = 0;
+        if ((flags & 64) != 0) {
+            builder.addAction(android.R.drawable.ic_media_previous, "Anterior", action(PREVIOUS, 4));
+            count++;
+        }
+        builder.addAction(paused ? android.R.drawable.ic_media_play : android.R.drawable.ic_media_pause,
+                paused ? "Reanudar" : "Pausar", action(paused ? PLAY : PAUSE, 1));
+        count++;
+        if ((flags & 128) != 0) {
+            builder.addAction(android.R.drawable.ic_media_next, "Siguiente", action(NEXT, 5));
+            count++;
+        }
+        builder.addAction(android.R.drawable.ic_menu_close_clear_cancel, "Detener", action(STOP, 2));
+        int[] compact = count >= 3 ? new int[] {0, 1, 2} : new int[] {0, 1};
+        return builder
                 .setStyle(new Notification.MediaStyle().setMediaSession(session.getSessionToken())
-                        .setShowActionsInCompactView(0, 1))
+                        .setShowActionsInCompactView(compact))
                 .build();
     }
 

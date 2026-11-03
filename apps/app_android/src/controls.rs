@@ -34,6 +34,8 @@ pub enum Icon {
     Play,
     Pause,
     Stop,
+    Previous,
+    Next,
     Fullscreen,
     Restore,
     Sound,
@@ -61,6 +63,29 @@ pub fn button(ui: &mut egui::Ui, icon: Icon, label: &str, enabled: bool) -> egui
                 color,
                 egui::Stroke::NONE,
             ));
+        }
+        Icon::Previous | Icon::Next => {
+            let direction = if matches!(icon, Icon::Next) {
+                1.0
+            } else {
+                -1.0
+            };
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    center + egui::vec2(-7.0 * direction, -9.0),
+                    center + egui::vec2(5.0 * direction, 0.0),
+                    center + egui::vec2(-7.0 * direction, 9.0),
+                ],
+                color,
+                egui::Stroke::NONE,
+            ));
+            painter.line_segment(
+                [
+                    center + egui::vec2(8.0 * direction, -9.0),
+                    center + egui::vec2(8.0 * direction, 9.0),
+                ],
+                (3.0, color),
+            );
         }
         Icon::Pause => {
             for x in [-5.0, 5.0] {
@@ -311,9 +336,11 @@ mod tests {
                                 let draw_buttons = |ui: &mut egui::Ui| {
                                     let mut buttons = Vec::new();
                                     for icon in [
+                                        Icon::Previous,
                                         Icon::Play,
                                         Icon::Pause,
                                         Icon::Stop,
+                                        Icon::Next,
                                         if width > 400.0 {
                                             Icon::Sound
                                         } else {
@@ -348,6 +375,7 @@ mod tests {
                                     slider_width = slider.rect.width();
                                     for rect in buttons {
                                         assert_eq!(rect.size(), egui::Vec2::splat(CONTROL_SIZE));
+                                        assert!(rect.right() <= right + 1.0);
                                         if stacked(width) {
                                             assert!(rect.bottom() <= slider.rect.top());
                                         } else {
@@ -365,7 +393,7 @@ mod tests {
                 );
                 assert!(slider_width > 0.0);
                 if width == 800.0 {
-                    assert!(slider_width > 400.0);
+                    assert!(slider_width > 300.0);
                 }
             }
         }

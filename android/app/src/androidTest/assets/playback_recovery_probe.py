@@ -15,6 +15,7 @@ import yt_dlp_runner as runner
 
 _original_extract = runner._extract_media
 _original_fallback = runner.extract_media_with_fallback
+_original_playlist_limit = runner._PLAYLIST_LIMIT
 _lock = threading.Lock()
 _state = {}
 
@@ -60,6 +61,7 @@ _public_music = "https://music.youtube.com/playlist?list=PLt5yu3-wZAlQLfIN0MMgp0
 _radio_urls = {
     "music_radio": "https://youtube.com/playlist?list=RDUsR08cY8k0A",
     "music_radio_second": "https://youtube.com/playlist?list=RD98WtmW-lfeE",
+    "music_radio_screenshot": "https://youtube.com/playlist?list=RD3LXr89pMU2Q",
 }
 
 
@@ -82,6 +84,7 @@ class Bridge:
 
 
 def configure(scenario):
+    runner._PLAYLIST_LIMIT = 2 if scenario.startswith("music_account") else _original_playlist_limit
     with _lock:
         _state.clear()
         _state.update(scenario=scenario, calls=[], denied=0, served=0, done=False)
@@ -89,6 +92,8 @@ def configure(scenario):
         return f"https://music.youtube.com/watch?v=RecoverTest1&probe={scenario}&list=RDMM"
     if scenario == "music_public":
         return _public_music
+    if scenario.startswith("music_account"):
+        return _radio_urls["music_radio_screenshot"]
     if scenario in _radio_urls:
         return _radio_urls[scenario]
     if scenario.startswith("music_compare"):
@@ -154,6 +159,10 @@ def extract(url, audio_only, runtime_path, cache_dir, downloader=None):
         payload.update(url=_base + "/short", playlist=[_base + "/audio"],
                        entry_ids=["short", "RecoverTest1"],
                        playlist_notice="Lista: 2 reproducibles, 1 omitidos. Limite: 100 por carga.")
+    if scenario == "playlist_navigation":
+        payload.update(url=_base + "/audio", playlist=[_base + "/audio", _base + "/audio"],
+                       entry_ids=["RecoverTest1", "second", "third"],
+                       playlist_notice="Lista: 3 reproducibles, 0 omitidos. Limite: 100 por carga.")
     result = json.dumps(payload)
     with _lock:
         _state["done"] = True
@@ -164,6 +173,39 @@ def fallback(url, audio_only, runtime_path, cache_dir, cookie_bridge,
              cookies_only=False, refresh=False):
     with _lock:
         scenario = _state.get("scenario", "")
+    if scenario.startswith("music_account"):
+        if not cookies_only:
+            raise RuntimeError("Account probe requires explicit session mode")
+
+        class AccountBridge:
+            def prepareSupportedSiteCookiesForFallback(self, source):
+                path = cookie_bridge.prepareSupportedSiteCookiesForFallback(source)
+                with _lock:
+                    _state["cookie_file"] = path
+                return path
+
+            def setSupportedSiteCookiesFallbackStatus(self, status):
+                cookie_bridge.setSupportedSiteCookiesFallbackStatus(status)
+
+        with _lock:
+            _state["calls"].append("cookies")
+        try:
+            if scenario == "music_account_auth":
+                check_account_authentication(AccountBridge())
+            result = _original_fallback(
+                url, audio_only, runtime_path, cache_dir, AccountBridge(), True, refresh)
+        except (runner.DownloadError, RuntimeError):
+            with _lock:
+                _state["account_failed"] = True
+                _state["authentication_rejected"] = runner._errors.invalid_youtube_session
+            raise
+        media = json.loads(result)
+        if not media.get("used_cookies") or not media.get("playlist_notice"):
+            raise RuntimeError("Account probe did not resolve an account playlist")
+        with _lock:
+            _state["entries"] = len(media["entry_ids"])
+            _state["done"] = True
+        return result
     if scenario.startswith("music_compare"):
         if cookies_only:
             raise RuntimeError("Comparison probe never opens saved cookies")
@@ -244,6 +286,36 @@ def fallback(url, audio_only, runtime_path, cache_dir, cookie_bridge,
                               cookies_only, refresh)
 
 
+def check_account_authentication(bridge):
+    """Compare with a normal yt-dlp webpage request, outside the app resolver."""
+    runner._errors.invalid_youtube_session = False
+    path = bridge.prepareSupportedSiteCookiesForFallback("https://www.youtube.com/")
+    if not path:
+        raise RuntimeError("Account check has no saved YouTube cookies")
+    try:
+        with runner.YoutubeDL({
+            "cookiefile": path, "quiet": True, "logger": runner._errors, "socket_timeout": 10,
+        }) as downloader:
+            extractor = downloader.get_info_extractor("YoutubeTab")
+            extractor.initialize()
+            before = extractor.is_authenticated
+            webpage = extractor._download_webpage(
+                "https://www.youtube.com/feed/library", "account-check")
+            configuration = extractor.extract_ytcfg("account-check", webpage)
+            logged_in = configuration.get("LOGGED_IN")
+            after = extractor.is_authenticated
+        with _lock:
+            _state.update(
+                auth_cookies_before_request=before,
+                server_logged_in=logged_in,
+                auth_cookies_after_request=after,
+            )
+        if not (before and logged_in is True and after):
+            raise RuntimeError("YouTube did not confirm authentication in the baseline yt-dlp request")
+    finally:
+        os.remove(path)
+
+
 def state():
     with _lock:
         result = dict(_state)
@@ -261,6 +333,7 @@ def release():
 def close():
     runner._extract_media = _original_extract
     runner.extract_media_with_fallback = _original_fallback
+    runner._PLAYLIST_LIMIT = _original_playlist_limit
     _server.shutdown()
     _server.server_close()
     _thread.join(timeout=5)

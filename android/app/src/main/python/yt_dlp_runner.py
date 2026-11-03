@@ -203,6 +203,10 @@ _LOGIN_REQUIRED_HINTS = (
     "age restricted",
     "sensitive",
 )
+_YOUTUBE_SESSION_REJECTED = (
+    "La sesion de YouTube no fue aceptada o dejo de estar activa durante la consulta. "
+    "No se usara una lista anonima."
+)
 
 
 class _ErrorLog:
@@ -230,8 +234,10 @@ class _ErrorLog:
     def warning(self, message: str) -> None:
         if "youtube account cookies are no longer valid" in message.lower():
             self.invalid_youtube_session = True
+            _progress(_YOUTUBE_SESSION_REJECTED)
+        else:
+            _progress("El sitio dio un aviso; la resolucion sigue en curso.")
         print(f"[yt-dlp] {message}", flush=True)
-        _progress("El sitio dio un aviso; la resolucion sigue en curso.")
 
     def error(self, message: str) -> None:
         self.last = message
@@ -554,9 +560,7 @@ def _account_media(
             _errors.invalid_youtube_session
             or not downloader.get_info_extractor("Youtube").is_authenticated
         ):
-            raise RuntimeError(
-                "La sesion de YouTube dejo de ser valida durante la consulta; "
-                "exporta e importa cookies.txt de nuevo. No se usara una lista anonima.")
+            raise RuntimeError(_YOUTUBE_SESSION_REJECTED)
         result["used_cookies"] = True
         return json.dumps(result)
     finally:
@@ -578,9 +582,7 @@ def _check_account_playlist_session(youtube: bool) -> None:
         _errors.invalid_youtube_session
         or not _account_downloader.get_info_extractor("Youtube").is_authenticated
     ):
-        raise RuntimeError(
-            "La sesion de YouTube no es valida; importa cookies actuales. "
-            "No se usara una lista anonima.")
+        raise RuntimeError(_YOUTUBE_SESSION_REJECTED)
 
 
 def _publish_playlist(media: list[dict], skipped: int, youtube: bool) -> None:

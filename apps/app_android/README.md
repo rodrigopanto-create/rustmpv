@@ -76,6 +76,11 @@ continuen automaticamente. Los elementos privados o no disponibles se
 omiten; la interfaz informa el error si no queda ninguno reproducible.
 Las listas mayores se limitan a sus primeros 100 elementos; los enlaces
 individuales y las URLs directas mantienen el comportamiento anterior.
+Los botones **Anterior** y **Siguiente** cambian entre elementos listos sin
+repetir la extraccion ni cancelar la cola progresiva. Conservan la pausa,
+no saltan del ultimo al primero y se deshabilitan en los extremos o durante
+la carga/recuperacion. La notificacion, la pantalla de bloqueo y los controles
+multimedia de auriculares comparten las mismas comprobaciones.
 
 Ademas de YouTube, yt-dlp resuelve enlaces de X/Twitter (`x.com`,
 `twitter.com`), Instagram (`instagram.com`, `instagr.am`) y Facebook
@@ -278,7 +283,7 @@ el deslizador quedan anclados al borde inferior del area util, por encima
 de la barra de navegacion Android. La URL y el selector Audio/Video siguen
 arriba, y el video utiliza el espacio entre ambos sin solapar los controles.
 En ambas orientaciones forman una sola fila centrada verticalmente:
-Play, Pausa, Stop, pantalla completa, deslizador expansible y reloj.
+Anterior, Play, Pausa, Stop, Siguiente, sonido, pantalla completa, deslizador expansible y reloj.
 El deslizador reserva el ancho real del reloj, incluso al mostrar horas.
 Tras mas de 3 segundos sin actividad durante la reproduccion, la fila
 se oculta; mover el puntero, tocar o usar el teclado la vuelve a mostrar.

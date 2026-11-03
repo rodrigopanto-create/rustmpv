@@ -441,6 +441,55 @@ class RunnerTests(unittest.TestCase):
         self.downloader.close.assert_called_once()
         remove.assert_called_once()
 
+    def test_public_seeded_radio_still_honors_explicit_account_mode(self):
+        for prefix in ("RD", "RDAMVM"):
+            with self.subTest(prefix=prefix):
+                bridge = self.fallback_bridge()
+                self.downloader.extract_info.return_value = {
+                    "_type": "playlist",
+                    "entries": [{"id": "3LXr89pMU2Q", "url": "https://cdn.example/account"}],
+                }
+                with patch.object(self.runner.os, "remove"):
+                    media = json.loads(self.runner.extract_media_with_fallback(
+                        f"https://youtube.com/playlist?list={prefix}3LXr89pMU2Q",
+                        True, self.runtime_path, None, bridge, cookies_only=True))
+                bridge.prepareAnonymousExtraction.assert_not_called()
+                bridge.setSupportedSiteCookiesFallbackStatus.assert_called_once_with("session")
+                self.assertTrue(media["used_cookies"])
+                self.downloader.extract_info.assert_called_with(
+                    f"https://youtube.com/watch?v=3LXr89pMU2Q&list={prefix}3LXr89pMU2Q",
+                    download=False)
+
+    def test_public_radio_with_explicit_session_never_accepts_rejected_authentication(self):
+        bridge = self.fallback_bridge()
+
+        def rejected(*_args, **_kwargs):
+            self.runner._errors.warning(
+                "[youtube:tab] The provided YouTube account cookies are no longer valid.")
+            return {"_type": "playlist", "entries": [
+                {"id": "3LXr89pMU2Q", "url": "https://cdn.example/guest"},
+            ]}
+
+        self.downloader.extract_info.side_effect = rejected
+        with patch.object(self.runner.os, "remove") as remove:
+            with self.assertRaisesRegex(RuntimeError, "No se usara una lista anonima"):
+                self.runner.extract_media_with_fallback(
+                    "https://youtube.com/playlist?list=RD3LXr89pMU2Q",
+                    True, self.runtime_path, None, bridge, cookies_only=True)
+        bridge.prepareAnonymousExtraction.assert_not_called()
+        remove.assert_called_once()
+
+    def test_rejected_session_progress_reports_authentication_not_cookie_age(self):
+        bridge = self.fallback_bridge()
+        self.runner._request = (bridge, 7)
+        self.runner._errors.warning(
+            "[youtube:tab] The provided YouTube account cookies are no longer valid.")
+        self.assertTrue(self.runner._errors.invalid_youtube_session)
+        bridge.reportMediaExtractionProgress.assert_called_once_with(
+            7, self.runner._YOUTUBE_SESSION_REJECTED)
+        self.assertNotIn("importa", self.runner._YOUTUBE_SESSION_REJECTED)
+        self.assertNotIn("caduc", self.runner._YOUTUBE_SESSION_REJECTED)
+
     def test_personal_playlist_without_cookies_never_substitutes_anonymous_mix(self):
         bridge = self.fallback_bridge("")
         with self.assertRaisesRegex(RuntimeError, "No se sustituye una lista personal"):

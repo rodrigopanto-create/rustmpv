@@ -134,6 +134,36 @@ mod native {
         poll_state(&mut state, &mut playback);
     }
 
+    fn navigate(context: usize, playback: &mut Playback, next: bool) -> Result<(), String> {
+        if !playback.can_navigate(next) {
+            return Err("No hay otro elemento listo en esa direccion de la lista".to_owned());
+        }
+        crate::history::observe(playback);
+        crate::send_mpv_command(
+            context,
+            &[
+                if next {
+                    "playlist-next"
+                } else {
+                    "playlist-prev"
+                },
+                "weak",
+            ],
+        )?;
+        playback.loading();
+        Ok(())
+    }
+
+    pub fn navigate_playlist(next: bool) -> Result<(), String> {
+        let state = STATE.lock().expect("playback lifecycle lock");
+        let playback = state.playback.as_ref().ok_or("No hay reproductor activo")?;
+        navigate(
+            state.context,
+            &mut playback.lock().expect("playback lock"),
+            next,
+        )
+    }
+
     fn poll_state(state: &mut State, playback: &mut Playback) {
         #[cfg(feature = "chaquopy")]
         if let Some(error) = state
@@ -343,6 +373,15 @@ mod native {
             return 0;
         };
         let mut playback = playback.lock().expect("playback lock");
+        if matches!(action, 3 | 4) {
+            return match navigate(state.context, &mut playback, action == 4) {
+                Ok(()) => 1,
+                Err(error) => {
+                    log::error!("Cambiar elemento de la lista desde el servicio: {error}");
+                    0
+                }
+            };
+        }
         let command: &[&str] = match action {
             0 => &["set", "pause", "no"],
             1 => &["set", "pause", "yes"],
@@ -386,7 +425,7 @@ pub use native::{
     update_input,
 };
 #[cfg(target_os = "android")]
-pub use native::{cancel, poll, register, set_paused, set_video};
+pub use native::{cancel, navigate_playlist, poll, register, set_paused, set_video};
 
 #[cfg(test)]
 mod tests {

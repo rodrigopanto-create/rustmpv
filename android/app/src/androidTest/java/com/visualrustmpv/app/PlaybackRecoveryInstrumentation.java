@@ -41,7 +41,8 @@ public final class PlaybackRecoveryInstrumentation extends Instrumentation {
         try {
             activity = startActivitySync(new Intent(getTargetContext(), MainActivity.class)
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
-            SystemClock.sleep(4000);
+            // The startup splash may remain visible for eight seconds on a cold worker.
+            SystemClock.sleep(12000);
             tick = nativeMethod("nativeTick");
             position = nativeMethod("nativePosition");
             control = nativeMethod("nativeControl", int.class);
@@ -65,9 +66,10 @@ public final class PlaybackRecoveryInstrumentation extends Instrumentation {
                     "music_public", "progressive_guest", "progressive_session",
                     "progressive_cancel", "background_progressive",
                     "music_compare_m4a", "music_compare_opus", "music_compare_default",
-                    "music_radio", "music_radio_second"}) {
+                    "music_radio", "music_radio_second", "music_radio_screenshot",
+                    "music_account", "music_account_auth", "playlist_navigation"}) {
                 if ((scenario.equals("resolve_cancel") || scenario.startsWith("music_")
-                        || scenario.contains("progressive"))
+                        || scenario.contains("progressive") || scenario.equals("playlist_navigation"))
                         && selected == null) continue;
                 if (selected != null && !Arrays.asList(selected.split(",")).contains(scenario)) {
                     continue;
@@ -163,12 +165,16 @@ public final class PlaybackRecoveryInstrumentation extends Instrumentation {
         tap("paste");
         SystemClock.sleep(500);
         shell("input keyevent KEYCODE_BACK");
-        if (scenario.startsWith("music_radio")) {
-            // These public-radio checks deliberately select guest mode, not the owner's account.
+        if (scenario.startsWith("music_account")) {
+            // Only this opt-in scenario opens the owner's saved account cookies.
             tap("session");
         }
         SystemClock.sleep(700);
         tap("play");
+        if (scenario.equals("playlist_navigation")) {
+            runPlaylistNavigation();
+            return;
+        }
         if (scenario.contains("progressive")) {
             runProgressiveScenario(scenario);
             return;
@@ -180,6 +186,9 @@ public final class PlaybackRecoveryInstrumentation extends Instrumentation {
         long deadline = SystemClock.elapsedRealtime() + 120000;
         while (SystemClock.elapsedRealtime() < deadline) {
             JSONObject state = state();
+            if (state.optBoolean("account_failed")) {
+                throw new AssertionError("Account extraction failed: " + state);
+            }
             int calls = state.getJSONArray("calls").length();
             // While screen-off, only the service ticker may drive extraction/loading.
             long flags = screenOff ? 0 : (long) tick.invoke(null);
@@ -246,6 +255,8 @@ public final class PlaybackRecoveryInstrumentation extends Instrumentation {
                     : scenario.endsWith("exhaust") ? calls == 3 && (flags & 16) != 0
                     : scenario.equals("music_session")
                             ? state.getInt("served") >= 2 && (flags & 5) == 5 && milliseconds >= 2000
+                    : scenario.startsWith("music_account")
+                            ? state.getBoolean("done") && (flags & 5) == 5 && milliseconds >= 2000
                     : (flags & 5) == 5 && milliseconds >= 2000;
             if (complete) {
                 SystemClock.sleep(1500);
@@ -255,7 +266,8 @@ public final class PlaybackRecoveryInstrumentation extends Instrumentation {
                 }
                 String expected = (scenario.equals("music_public") || scenario.startsWith("music_compare")
                         || scenario.startsWith("music_radio")) ? "[\"guest\"]"
-                        : scenario.equals("music_session") ? "[\"cookies\"]"
+                        : (scenario.equals("music_session") || scenario.startsWith("music_account"))
+                                ? "[\"cookies\"]"
                         : scenario.endsWith("cookies") || scenario.endsWith("exhaust")
                                 ? "[\"guest\",\"guest\",\"cookies\"]" : "[\"guest\",\"guest\"]";
                 if (!state.getJSONArray("calls").toString().equals(expected)
@@ -279,6 +291,58 @@ public final class PlaybackRecoveryInstrumentation extends Instrumentation {
             SystemClock.sleep(100);
         }
         throw new AssertionError(scenario + ": recovery timeout: " + state());
+    }
+
+    private void awaitNavigation(int expected, boolean paused) throws Exception {
+        long deadline = SystemClock.elapsedRealtime() + 15000;
+        while (SystemClock.elapsedRealtime() < deadline) {
+            long flags = (long) tick.invoke(null);
+            if ((flags & 16) != 0) throw new AssertionError("Navigation caused a playback error");
+            if ((flags & 197) == (expected | 5) && ((flags & 2) != 0) == paused
+                    && (paused || (long) position.invoke(null) >= 300)) return;
+            SystemClock.sleep(100);
+        }
+        throw new AssertionError("Navigation state timeout: " + tick.invoke(null));
+    }
+
+    private void runPlaylistNavigation() throws Exception {
+        awaitNavigation(128, false);
+        if ((boolean) control.invoke(null, 3)) {
+            throw new AssertionError("Previous was accepted at the start of the playlist");
+        }
+        if (!(boolean) control.invoke(null, 1)) throw new AssertionError("Pause failed");
+        tap("next");
+        awaitNavigation(192, true);
+        // Verify the notification uses the same navigation while paused.
+        StatusBarNotification[] notifications = getTargetContext()
+                .getSystemService(NotificationManager.class).getActiveNotifications();
+        boolean sent = false;
+        for (StatusBarNotification notification : notifications) {
+            if (notification.getNotification().actions == null) continue;
+            for (android.app.Notification.Action action : notification.getNotification().actions) {
+                if ("Siguiente".contentEquals(action.title)) {
+                    action.actionIntent.send();
+                    sent = true;
+                    break;
+                }
+            }
+        }
+        if (!sent) throw new AssertionError("Notification has no Next action");
+        awaitNavigation(64, true);
+        if ((boolean) control.invoke(null, 4)) {
+            throw new AssertionError("Next was accepted at the end of the playlist");
+        }
+        tap("previous");
+        awaitNavigation(192, true);
+        tap("previous");
+        awaitNavigation(128, true);
+        if (!(boolean) control.invoke(null, 0)) throw new AssertionError("Resume failed");
+        awaitNavigation(128, false);
+        if (state().getJSONArray("calls").length() != 1) {
+            throw new AssertionError("Navigation restarted extraction");
+        }
+        Log.i("RecoveryTest", "PASS playlist_navigation: UI previous/next, notification next, "
+                + "boundaries, Pause/Resume, one extraction");
     }
 
     private void runProgressiveScenario(String scenario) throws Exception {
