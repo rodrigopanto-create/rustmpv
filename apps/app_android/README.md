@@ -91,9 +91,13 @@ ofrecen audio separado ni altura conocida, los formatos son
 `best[ext=mp4][height<=720][protocol^=http]/best[ext=mp4][height<=720]/best[height<=720]/best`
 (Video): se prefiere un MP4 progresivo con audio y video en un solo stream.
 Las publicaciones con varios videos (carruseles de Instagram, tweets con
-varios clips) se encolan igual que una lista. Solo funcionan publicaciones
-publicas: el contenido que exige sesion iniciada falla con el error de yt-dlp,
-porque la app no envia cookies. Cuando la extraccion falla, la UI muestra en
+varios clips) se encolan igual que una lista. La misma caja de URL acepta los
+cuatro sitios. YouTube publico intenta sin cuenta primero; X, Instagram,
+Facebook y listas personales prueban las cookies del sitio y luego acceso
+publico si falla. Si termina sin cuenta, se avisa: las recomendaciones pueden
+ser distintas. Importar cookies de un sitio conserva las de los otros; cada
+extractor publico tiene estado aislado y no depende del proveedor de YouTube.
+Cuando ambas vias fallan, la UI muestra en
 rojo el motivo real de yt-dlp (por ejemplo, "La publicacion no es publica o
 requiere iniciar sesion...") mientras la URL no cambie; la linea de estado
 de depuracion sigue oculta. Verificado en Redmi Note 8 Pro (Android 11): un
@@ -249,6 +253,18 @@ Comprobado en el telefono con Big Buck Bunny:
 3. Con la pantalla apagada el archivo siguio avanzando (96.9 s).
 
 ### Video integrado y controles
+
+La interfaz Android usa paneles de terminal retrofuturista: fondo negro azulado,
+verde fosforo para transporte y cian para secciones. El orden es fuente/modo,
+reproductor, consola, **ACCESO Y MOTOR** plegable e historial en tarjetas.
+El acceso es automatico, sin selector de sesion. Las cookies y la actualizacion
+de yt-dlp estan en ese panel plegable; los errores
+de importacion siguen visibles. La consola monoespaciada tiene scroll acotado y
+colores de error/aviso, sin eventos ficticios ni efectos sobre el video.
+El borde cian de la etapa activa pulsa suavemente cada 2.4 segundos: fuente,
+consola, acceso/motor cuando interviene y reproductor al cargar o reproducir.
+No se apaga ni cambia el ancho del marco; el historial no pulsa.
+Windows no cambia. Los controles conservan su anclaje y los margenes del sistema.
 
 `src/video.rs` usa la API de render de libmpv en un contexto **OpenGL ES 3**
 EGL separado, con un Pbuffer de 1 x 1 y texturas compartidas con eframe/Glow.

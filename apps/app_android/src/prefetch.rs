@@ -162,6 +162,27 @@ mod tests {
     }
 
     #[test]
+    fn switching_sites_drops_obsolete_results_and_tokens() {
+        let mut prefetch = Prefetcher::default();
+        let now = Instant::now();
+        for input in [
+            "https://youtube.com/watch?v=abcdefghijk",
+            "https://x.com/user/status/1",
+            "https://instagram.com/reel/abc/",
+            "https://facebook.com/user/videos/1/",
+        ] {
+            let (sender, receiver) = mpsc::channel::<Result<u32, String>>();
+            let token = Arc::new(());
+            let weak = Arc::downgrade(&token);
+            prefetch.start(key(input, true), receiver, token);
+            prefetch = Prefetcher::default();
+            assert!(weak.upgrade().is_none());
+            assert!(sender.send(Ok(7)).is_err());
+            assert!(prefetch.poll(now).is_none());
+        }
+    }
+
+    #[test]
     fn waits_for_stable_input_before_starting() {
         let mut prefetch = Prefetcher::<u32>::default();
         let start = Instant::now();

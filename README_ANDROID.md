@@ -97,6 +97,27 @@ their reason; manual Play can retry normally.
 
 ### Player controls and resolution progress
 
+Android uses a retro terminal layout: deep blue-black surfaces, phosphor-green
+transport accents and cyan section labels. A shared source/mode input with
+automatic access comes first, followed by observed player state, the bounded
+process console, collapsed **ACCESO Y MOTOR** settings and history cards.
+Cookie import/removal and yt-dlp updates remain in that settings section;
+import errors remain visible even when it is collapsed.
+The monospace console shows actual resolver events with distinct error/warning
+colors, an independent scroll area and no decorative/fake output. A gentle cyan
+border pulse (one cycle per 2.4 seconds, never an on/off flash) follows the active
+stage: source/editing, process console, account access or engine maintenance,
+then playback. Account access is highlighted only in account mode or after an
+actual fallback notification; guest extraction skips it. Playback takes priority
+over remaining queue extraction. Idle, stopped and failed flows return to source;
+history does not pulse. Borders keep a fixed width so the layout never moves.
+The pulse build passed 82 Android Rust tests and
+`PASS: playlist_navigation,progressive_guest,music_session` on the OPPO.
+Device frame samples confirmed that only the active border changed color;
+inactive borders remained unchanged.
+The theme is Android-only; Windows is unchanged. Normal text palette pairs are
+tested at a minimum 4.5:1 contrast, with responsive 320-to-800-point layouts.
+
 The speaker button switches libmpv sound ON/OFF without pausing or seeking;
 the selection survives subsequent loads in the same app session. Narrow portrait
 layouts put the seek bar below the transport buttons. The URL, resolver status,
@@ -209,24 +230,44 @@ also appears in the process console. Checked on the Redmi
 Note 8 Pro (Android 11): a public Instagram reel rendered; restricted tweets
 and login-only reels showed the red error.
 
-### Anonymous-first extraction with cookie fallback
+### Automatic access and per-site cookie fallback
 
-Normal Android extraction **first tries without account credentials**: no imported
-cookie jar, browser cookies, OAuth, username/password or netrc. Previously saved
+Normal Android extraction chooses the likely access mode automatically.
+Public YouTube videos/radios try without account credentials first; X/Twitter,
+Instagram, Facebook and recognizable personal YouTube lists try saved cookies
+first, then public access if unavailable or rejected. No session selector is
+needed. A public fallback is announced visibly; recommendations can differ.
+Previously saved
 YouTube, X/Twitter, Instagram and Facebook cookies remain encrypted with Android
-Keystore and excluded from backups/device transfers. If anonymous extraction
-fails, the app makes **one** retry with cookies matching that platform, using a
+Keystore and excluded from backups/device transfers. If the first extraction
+fails, the app makes **one** attempt with the alternate access mode, using a
 fresh yt-dlp instance and account-compatible default YouTube clients with QuickJS.
 Cookies are decrypted lazily to a private temporary file, removed after the
 retry even on failure; account downloaders are closed and never enter the guest
 cache. Missing cookies produce an actionable error; two failed attempts report
 both reasons. Provider initialization failure can also fall back to cookies.
-Successful guest extractions and background warm-up/update verification never
+YouTube guest-first successes and background warm-up/update verification never
 decrypt saved cookies. Invalid URLs and programming errors do not trigger login.
 **Importar/Cambiar cookies de fallback** selects Netscape `cookies.txt` for these
-four platforms; importing replaces the saved jar. **Eliminar cookies guardadas**
+four platforms; importing replaces cookies only for the platforms in that file,
+preserving saved cookies for other platforms. **Eliminar cookies guardadas**
 explicitly removes it. The UI indicates when the fallback uses your account.
 Extractors may create their own guest-session cookies in memory.
+Guest downloaders are isolated by platform; social extraction does not require
+YouTube's Node/bgutil provider. Editing/pasting another URL or changing mode
+cancels obsolete worker results, prefetch and recovery, clears old notices and
+keeps the existing media playing until another source is loaded.
+The automatic-access build passed the OPPO's five synthetic switching scenarios:
+`cross_site_youtube,cross_site_twitter,cross_site_instagram,cross_site_facebook,cross_site_return`.
+These use localhost audio and synthetic cookies, verify cookie merging/alias
+isolation, and never certify real social-account permissions. The same APK
+passed `guest,cookies,progressive_guest,music_session,progressive_session,playlist_navigation,music_radio_screenshot`
+and a separate `resolve_cancel`. The radio case verifies real public YouTube;
+restricted social URLs still require owner testing with valid site cookies.
+The final APK also passed
+`cross_site_youtube,cross_site_twitter,cross_site_instagram,cross_site_facebook,cross_site_return,playlist_navigation,music_radio_screenshot`
+on the Redmi Note 8 Pro after installation preserving app data and cookies.
+The separate test APK was removed afterward.
 Other HTTP(S) hosts still go directly to libmpv.
 Extraction does not rerun a partially successful playlist just for skipped entries.
 Account cookies are sensitive and may expose the account to platform restrictions;
@@ -245,21 +286,16 @@ the playlist-page route as "This playlist type is unviewable". The seed, list,
 index and sharing parameters are preserved. Other personal list IDs are not
 guessed or replaced.
 
-**Usar mi sesion de YouTube / Music** selects account-only extraction from the
-start. Seeded public radios (`RD` or `RDAMVM` plus an 11-character video ID)
-default OFF: they can play without proving account authentication, like mpv's
-normal public playback. The selector still defaults ON for other `RD...`
-personal mixes, Watch Later (`WL`), liked videos (`LL`) and Music likes (`LM`). You can override it,
-or enable it for other personal/private lists. Defaults are recalculated when
-the input URL changes. Import current Netscape cookies from the intended account;
+The former **Usar mi sesion de YouTube / Music** selector is replaced by automatic
+fallback. Seeded public radios (`RD` or `RDAMVM` plus an 11-character video ID)
+start publicly. Other `RD...` personal mixes, Watch Later (`WL`), liked videos
+(`LL`) and Music likes (`LM`) try account access first. Other private playlists
+start publicly and can retry with cookies. Import current Netscape cookies from the intended account;
 the app cannot infer a session from the YouTube/Music app installed on the phone.
-Missing or rejected cookies produce an error, never a successful anonymous
-replacement for a requested personal list. Turning the selector OFF deliberately
-uses the normal anonymous-first fallback instead.
+Missing or rejected cookies allow one public attempt, with a visible notice
+that personalization can differ. If both attempts fail, both reasons are shown.
 Public playback is not evidence that account authentication or personalized
-recommendations work. Selecting account mode explicitly keeps strict session
-checks even on a public radio; a rejected session never silently becomes a guest mix.
-Session mode checks yt-dlp's YouTube authentication-cookie state before and after
+recommendations work. Account-first mode checks yt-dlp's YouTube authentication-cookie state before and after
 extraction and rejects its expired/rotated-cookie warning. This detects missing
 or lost authentication; it does not certify account entitlements or access.
 If the playlist response already reports invalid authentication, it fails before
@@ -267,7 +303,7 @@ enumerating or resolving its tracks, rather than spending minutes on a lost sess
 The UI reports this authentication rejection explicitly; it does not infer that
 the export is old or promise that repeatedly importing it will restore access.
 
-The session choice is part of the prefetch/cache identity. Account playlist
+URL and format are part of the prefetch/cache identity. Once published, account playlist
 streams retain account-only playback recovery, so a failed item cannot silently
 switch to a guest mix. Only the matching site's jar is decrypted and it is
 removed in `finally`, including cancellation.
@@ -362,12 +398,13 @@ With JDK/SDK configured and an unlocked phone permitting USB installation:
 .\android\gradlew.bat -p android :app:assembleDebugAndroidTest --no-daemon --max-workers=2
 adb install -r android\app\build\outputs\apk\debug\app-debug.apk
 adb install -r android\app\build\outputs\apk\androidTest\debug\app-debug-androidTest.apk
-adb shell am instrument -w -e pasteX 660 -e pasteY 155 -e playX 145 -e playY 1395 com.visualrustmpv.app.test/com.visualrustmpv.app.PlaybackRecoveryInstrumentation
+adb shell am instrument -w -e pasteX 610 -e pasteY 315 -e playX 145 -e playY 1365 com.visualrustmpv.app.test/com.visualrustmpv.app.PlaybackRecoveryInstrumentation
 adb uninstall com.visualrustmpv.app.test
 ```
 
 Build the app first with the main build script. The tap coordinates above are for
-the tested OPPO 720 x 1600 portrait layout; adjust them for another screen/density.
+the tested retro-terminal OPPO 720 x 1600 portrait layout; adjust them for another
+screen/density and use `adb -s SERIAL` when multiple devices are connected.
 Keep the phone nearby: screen-off cases wake it between scenarios and wait up to
 120 seconds for the owner to unlock it through Android's normal lock screen.
 The tests do not disable or bypass a secure lock.
@@ -377,7 +414,7 @@ to the instrumentation command; for foreground only, use
 `-e scenarios guest,cookies,cancel,exhaust`. Selected runs print `PASS:` followed
 by the selected names. Inspect this output, not just adb's exit code.
 The focused stuck-extractor test uses `-e scenarios resolve_cancel` plus
-`-e cancelX 320 -e cancelY 1395` for the OPPO's Stop button. It starts an infinite
+`-e cancelX 320 -e cancelY 1365` for the OPPO's Stop button. It starts an infinite
 Python loop, cancels via the actual player control, then pastes and plays a
 different URL using the same serial worker. It is opt-in rather than part of the
 default suite because it requires the additional Cancel coordinates.
@@ -400,6 +437,26 @@ Playlist navigation is opt-in with `-e scenarios playlist_navigation` plus
 three-item fixture checks both UI buttons, notification Next, disabled end
 boundaries, Pause/Resume and that navigation never restarts extraction.
 The existing Play coordinate now targets the second button, after Anterior.
+With the retro-terminal UI on the OPPO, use `nextX=410`, `previousX=55` and
+`nextY=previousY=1365`. The final APK printed
+`PASS: playlist_navigation,guest,progressive_guest,music_radio_screenshot`
+and `PASS: resolve_cancel`. All 80 Android Rust host tests passed, including
+contrast checks and themed source/console/transport layouts at narrow and wide
+widths. Portrait inspection confirmed the complete seek row, keyboard-safe
+transport controls and live process console.
+The same retro-terminal APK was installed on the Redmi Note 8 Pro without
+clearing app data. For its 1080 x 2340 portrait layout, use `pasteX=930`,
+`pasteY=410`, `playX=200`, `playY=2007`, `previousX=80`, `nextX=565`,
+`previousY=nextY=2007`, and `cancelX=440`, `cancelY=2007`.
+It printed `PASS: playlist_navigation,guest,progressive_guest,music_radio_screenshot,music_session,progressive_session`,
+`PASS: resolve_cancel`, and `PASS: background_progressive`.
+Individual runner logs also confirmed `cookies,cancel,exhaust,background_pause`.
+The subsequent progressive screen-off case initially stopped at the normal
+device lock; it passed separately after the owner unlocked the phone.
+Run `resolve_cancel` in a separate instrumentation invocation: it internally
+repeats `guest`, and including an earlier `guest` in the same process can reuse
+the resolved fixture URL and invalidate the expected extraction-call count.
+These synthetic session/fallback checks do not validate saved account cookies.
 Verified on the Redmi Note 8 Pro: `PASS: playlist_navigation` covered both UI
 buttons, notification Next, playlist boundaries and Pause/Resume with a single
 extraction. `guest,progressive_guest,music_radio_screenshot` also printed `PASS:`
@@ -412,8 +469,8 @@ mixes, `RDUsR08cY8k0A` and `RD98WtmW-lfeE`, were verified with advancing libmpv
 playback while the remaining queue was still resolving. These checks never
 open saved cookies; they do not certify personalized recommendations. Stored
 YouTube cookies on the Redmi produced yt-dlp's rotated-cookie warning.
-`-e scenarios music_account -e sessionX 42 -e sessionY 247` explicitly enables
-account mode for the latest screenshot radio (adjust coordinates to the device).
+`-e scenarios music_account` explicitly runs a strict account-only diagnostic
+for the latest screenshot radio, independent of the automatic UI policy.
 Unlike the synthetic scenarios, this opt-in test opens the owner's saved cookies
 and requires their authorization. It limits extraction to two entries and never
 retries anonymously; authentication
@@ -436,9 +493,11 @@ with playback reaching 2000 ms. Both real-cookie cases (`music_account` and
 `music_account_auth`) failed: the baseline had authentication before the request,
 but returned `LOGGED_IN=false` and lost authentication afterward. Temporary jars
 were deleted; the test APK was removed without clearing the app's saved cookies.
-For this Redmi's 1080 x 2340 layout, use `pasteX=915`, `pasteY=190`,
+For the earlier, pre-redesign Redmi 1080 x 2340 layout, tests used
+`pasteX=915`, `pasteY=190`,
 `playX=200`, `playY=2045`, `sessionX=42`, `sessionY=306`.
-Navigation uses `previousX=80`, `nextX=565`, and `previousY=nextY=2045`.
+Navigation used `previousX=80`, `nextX=565`, and `previousY=nextY=2045`.
+These historical coordinates must be remeasured for the retro-terminal UI.
 The same Redmi build also passed `music_public` and nine selected recovery,
 progressive-queue, cancellation and screen-off scenarios.
 Success prints `PASS: foreground and screen-off renewal, cookie retry, pause, Stop, bounded exhaustion`.

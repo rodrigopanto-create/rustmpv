@@ -67,9 +67,12 @@ public final class PlaybackRecoveryInstrumentation extends Instrumentation {
                     "progressive_cancel", "background_progressive",
                     "music_compare_m4a", "music_compare_opus", "music_compare_default",
                     "music_radio", "music_radio_second", "music_radio_screenshot",
-                    "music_account", "music_account_auth", "playlist_navigation"}) {
+                    "music_account", "music_account_auth", "playlist_navigation",
+                    "cross_site_youtube", "cross_site_twitter", "cross_site_instagram",
+                    "cross_site_facebook", "cross_site_return"}) {
                 if ((scenario.equals("resolve_cancel") || scenario.startsWith("music_")
-                        || scenario.contains("progressive") || scenario.equals("playlist_navigation"))
+                        || scenario.contains("progressive") || scenario.equals("playlist_navigation")
+                        || scenario.startsWith("cross_site"))
                         && selected == null) continue;
                 if (selected != null && !Arrays.asList(selected.split(",")).contains(scenario)) {
                     continue;
@@ -159,16 +162,13 @@ public final class PlaybackRecoveryInstrumentation extends Instrumentation {
         }
         SystemClock.sleep(1500);
         control.invoke(null, 2);
+        if (scenario.startsWith("cross_site")) verifySiteCookieMerge();
         String url = probe.callAttr("configure", scenario).toString();
         runOnMainSync(() -> getTargetContext().getSystemService(ClipboardManager.class)
                 .setPrimaryClip(ClipData.newPlainText("Recovery test", url)));
         tap("paste");
         SystemClock.sleep(500);
         shell("input keyevent KEYCODE_BACK");
-        if (scenario.startsWith("music_account")) {
-            // Only this opt-in scenario opens the owner's saved account cookies.
-            tap("session");
-        }
         SystemClock.sleep(700);
         tap("play");
         if (scenario.equals("playlist_navigation")) {
@@ -264,7 +264,10 @@ public final class PlaybackRecoveryInstrumentation extends Instrumentation {
                 if (scenario.startsWith("music_radio") && state.getBoolean("done")) {
                     throw new AssertionError("Radio playback waited for the complete queue");
                 }
-                String expected = (scenario.equals("music_public") || scenario.startsWith("music_compare")
+                String expected = scenario.startsWith("cross_site")
+                        ? (scenario.endsWith("youtube") || scenario.endsWith("return")
+                                ? "[\"guest\"]" : "[\"cookies\"]")
+                        : (scenario.equals("music_public") || scenario.startsWith("music_compare")
                         || scenario.startsWith("music_radio")) ? "[\"guest\"]"
                         : (scenario.equals("music_session") || scenario.startsWith("music_account"))
                                 ? "[\"cookies\"]"
@@ -278,9 +281,11 @@ public final class PlaybackRecoveryInstrumentation extends Instrumentation {
                     throw new AssertionError("Cancelled retry restarted playback");
                 }
                 if (!scenario.endsWith("cancel") && !scenario.startsWith("music_")
+                        && !scenario.startsWith("cross_site")
                         && state.getInt("denied") < 1) {
                     throw new AssertionError("No actual HTTP 403 was consumed");
                 }
+
                 if (background && (!screenOff || getTargetContext()
                         .getSystemService(PowerManager.class).isInteractive())) {
                     throw new AssertionError("Background recovery was not verified screen-off");
@@ -291,6 +296,25 @@ public final class PlaybackRecoveryInstrumentation extends Instrumentation {
             SystemClock.sleep(100);
         }
         throw new AssertionError(scenario + ": recovery timeout: " + state());
+    }
+
+    private void verifySiteCookieMerge() {
+        String youtube = ".youtube.com\tTRUE\t/\tTRUE\t0\tTEST\tyoutube\n";
+        String oldTwitter = ".x.com\tTRUE\t/\tTRUE\t0\tTEST\told\n";
+        String newTwitter = ".twitter.com\tTRUE\t/\tTRUE\t0\tTEST\tnew\n";
+        String instagram = "#HttpOnly_.instagram.com\tTRUE\t/\tTRUE\t0\tTEST\tinstagram\n";
+        byte[] stored = (youtube + oldTwitter).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] imported = (newTwitter + instagram).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        String merged = new String(SiteCookies.merge(stored, imported),
+                java.nio.charset.StandardCharsets.UTF_8);
+        if (!merged.contains(youtube) || !merged.contains(newTwitter)
+                || !merged.contains(instagram) || merged.contains(oldTwitter)) {
+            throw new AssertionError("Cookie merge did not preserve other sites or replace aliases");
+        }
+        if (SiteCookies.root("instagram.com.evil.example") != null
+                || !"facebook.com".equals(SiteCookies.root("fb.watch"))) {
+            throw new AssertionError("Cookie domain grouping is not isolated");
+        }
     }
 
     private void awaitNavigation(int expected, boolean paused) throws Exception {

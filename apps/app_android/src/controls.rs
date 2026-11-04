@@ -10,7 +10,7 @@ pub fn stacked(width: f32) -> bool {
 }
 
 pub fn panel_height(width: f32) -> f32 {
-    CONTROL_SIZE + 12.0 + if stacked(width) { 24.0 } else { 0.0 }
+    CONTROL_SIZE + 12.0 + if stacked(width) { 40.0 } else { 0.0 }
 }
 
 pub fn update_visibility(
@@ -50,7 +50,16 @@ pub fn button(ui: &mut egui::Ui, icon: Icon, label: &str, enabled: bool) -> egui
     );
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
     let center = response.rect.center();
-    let color = ui.style().interact(&response).fg_stroke.color;
+    let color = if enabled {
+        match icon {
+            Icon::Play => crate::terminal::GREEN,
+            Icon::Previous | Icon::Next => crate::terminal::CYAN,
+            Icon::Muted => crate::terminal::WARNING,
+            _ => ui.style().interact(&response).fg_stroke.color,
+        }
+    } else {
+        ui.style().interact(&response).fg_stroke.color
+    };
     let painter = ui.painter();
     match icon {
         Icon::Play => {
@@ -189,7 +198,7 @@ pub fn seek(
             ui.spacing_mut().slider_width = width;
             ui.add_enabled_ui(enabled, |ui| {
                 ui.add_sized(
-                    [width, 20.0],
+                    [width, ui.spacing().interact_size.y.max(20.0)],
                     egui::Slider::new(position, 0.0..=duration.unwrap_or(1.0)).show_value(false),
                 )
             })
@@ -308,13 +317,14 @@ mod tests {
 
     #[test]
     fn controls_and_seek_fit_narrow_and_wide_layouts() {
-        for width in [320.0, 360.0, 800.0] {
+        for width in [320.0, 360.0, 520.0, 600.0, 800.0] {
             for (duration, timer) in [
                 (Some(120.0), "0:10 / 2:00"),
                 (Some(7200.0), "1:01:01 / 2:00:00"),
                 (None, "0:00 / --:--"),
             ] {
                 let context = egui::Context::default();
+                crate::terminal::configure(&context);
                 let mut slider_width = 0.0;
                 let _ = context.run(
                     egui::RawInput {
@@ -381,7 +391,9 @@ mod tests {
                                         } else {
                                             assert!(
                                                 (rect.center().y - slider.rect.center().y).abs()
-                                                    < 1.0
+                                                    < 1.0,
+                                                "button={rect:?}, slider={:?}, width={width}",
+                                                slider.rect,
                                             );
                                         }
                                     }

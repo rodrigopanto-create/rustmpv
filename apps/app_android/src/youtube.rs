@@ -20,6 +20,7 @@ pub fn playlist_id(input: &str) -> Option<String> {
     .then_some(id)
 }
 
+#[cfg(test)]
 pub fn personalized(input: &str) -> bool {
     playlist_id(input).is_some_and(|id| {
         let public_radio = ["RDAMVM", "RD"]

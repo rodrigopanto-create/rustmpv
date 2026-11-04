@@ -44,6 +44,8 @@ mod recovery;
 mod screen;
 #[cfg(any(target_os = "android", feature = "yt-dlp-subprocess", test))]
 mod stream_url;
+#[cfg(any(target_os = "android", test))]
+mod terminal;
 #[cfg(target_os = "android")]
 mod video;
 #[cfg(any(target_os = "android", test))]
@@ -118,6 +120,8 @@ struct AndroidAppState {
     cookie_poll_at: std::time::Instant,
     #[cfg(feature = "chaquopy")]
     cookie_notice: Option<(String, bool)>,
+    #[cfg(feature = "chaquopy")]
+    session_access_active: bool,
     /// Fallo de yt-dlp visible solo mientras la URL siga siendo la misma.
     resolve_error: Option<(String, String)>,
     playback: std::sync::Arc<std::sync::Mutex<playback::Playback>>,
@@ -152,9 +156,8 @@ struct AndroidAppState {
     muted: bool,
     process_messages: std::collections::VecDeque<String>,
     resolution_started: Option<std::time::Instant>,
-    youtube_session: bool,
     session_input: String,
-    last_session: bool,
+    source_mode: PlaybackMode,
 }
 
 #[cfg(target_os = "android")]
@@ -181,24 +184,23 @@ impl AndroidAppState {
     }
 
     fn update_session_choice(&mut self) {
-        if self.session_input != self.url.trim() {
+        if self.session_input != self.url.trim() || self.source_mode != self.mode {
             #[cfg(feature = "chaquopy")]
-            if self.prefetch.pending()
-                || self
-                    .prefetch
-                    .ready()
-                    .is_some_and(|media| media.playlist_pending)
-                || self.stream_receiver.is_some()
-                || lifecycle::queue_pending()
             {
                 chaquopy::cancel_pending();
                 lifecycle::invalidate_recovery();
                 self.prefetch = prefetch::Prefetcher::default();
                 self.stream_receiver = None;
                 self.stream_token = None;
+                self.session_access_active = false;
+                self.cookie_notice = None;
             }
+            self.last_resolved_at = None;
+            self.resolve_error = None;
+            self.resolution_started = None;
+            self.process_messages.clear();
             self.session_input = self.url.trim().to_owned();
-            self.youtube_session = youtube::personalized(&self.session_input);
+            self.source_mode = self.mode;
         }
     }
 
@@ -311,6 +313,8 @@ impl AndroidAppState {
             cookie_poll_at: std::time::Instant::now(),
             #[cfg(feature = "chaquopy")]
             cookie_notice: None,
+            #[cfg(feature = "chaquopy")]
+            session_access_active: false,
             resolve_error: None,
             playback,
             mpv_context,
@@ -343,9 +347,8 @@ impl AndroidAppState {
             muted: false,
             process_messages: std::collections::VecDeque::new(),
             resolution_started: None,
-            youtube_session: false,
             session_input: String::new(),
-            last_session: false,
+            source_mode: PlaybackMode::Audio,
         }
     }
 }
@@ -383,7 +386,7 @@ fn startup_splash_visible(
 
 #[cfg(any(all(target_os = "android", feature = "chaquopy"), test))]
 fn draw_startup_splash(context: &egui::Context, mut frame: egui::Frame) -> egui::Rect {
-    frame.fill = egui::Color32::from_rgb(12, 18, 30);
+    frame.fill = terminal::BACKGROUND;
     egui::CentralPanel::default()
         .frame(frame)
         .show(context, |ui| {
@@ -394,16 +397,22 @@ fn draw_startup_splash(context: &egui::Context, mut frame: egui::Frame) -> egui:
             );
             ui.allocate_new_ui(egui::UiBuilder::new().max_rect(block), |ui| {
                 ui.vertical_centered(|ui| {
-                    ui.heading(
-                        egui::RichText::new("VisualRustMPV")
-                            .size(32.0)
+                    ui.label(
+                        egui::RichText::new("[VR] RUSTMPV")
+                            .monospace()
+                            .size(26.0)
                             .strong()
-                            .color(egui::Color32::from_rgb(113, 190, 255)),
+                            .color(terminal::GREEN),
                     );
                     ui.add_space(16.0);
                     ui.add(egui::Spinner::new().size(28.0));
                     ui.add_space(12.0);
-                    ui.label("Preparando el motor multimedia...");
+                    ui.label(
+                        egui::RichText::new("INICIANDO MOTOR MULTIMEDIA")
+                            .monospace()
+                            .size(11.0)
+                            .color(terminal::CYAN),
+                    );
                 })
                 .response
                 .rect
@@ -477,6 +486,10 @@ impl eframe::App for AndroidAppState {
         }
         let previous = self.status.clone();
         let process_pending = self.process_pending();
+        #[cfg(feature = "chaquopy")]
+        if !process_pending {
+            self.session_access_active = false;
+        }
         let playback = {
             let mut playback = self.playback.lock().expect("playback lock");
             history::observe(&playback);
@@ -591,7 +604,12 @@ impl eframe::App for AndroidAppState {
                     egui::TopBottomPanel::bottom("controls_panel")
                         .resizable(false)
                         .exact_height(controls::panel_height(ui.available_width()))
-                        .frame(egui::Frame::none().inner_margin(egui::Margin::symmetric(0.0, 6.0)))
+                        .frame(
+                            egui::Frame::none()
+                                .fill(terminal::PANEL)
+                                .stroke(egui::Stroke::new(1.0_f32, terminal::BORDER))
+                                .inner_margin(egui::Margin::symmetric(0.0, 6.0)),
+                        )
                         .show_inside(ui, |ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;
                             if controls::stacked(ui.available_width()) {
@@ -615,178 +633,49 @@ impl eframe::App for AndroidAppState {
                     .id_salt("player_content")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                ui.heading("VisualRustMPV Android");
-                ui.add_enabled_ui(!self.resolving(), |ui| {
-                    ui.horizontal(|ui| {
-                        let url_edit = ui.add(
-                            egui::TextEdit::singleline(&mut self.url).hint_text("URL del medio"),
-                        );
-                        if ui.button("📋 Pegar").clicked() {
-                            // The native egui backend reads Android's clipboard for this focused editor.
-                            url_edit.request_focus();
-                            match read_android_clipboard() {
-                                Ok(value) if !value.is_empty() => self.url = value,
-                                Ok(_) => self.status = "El portapapeles está vacío".to_owned(),
-                                Err(error) => {
-                                    self.status =
-                                        format!("No se pudo leer el portapapeles: {error}")
-                                }
-                            }
-                        }
-                    });
-                });
-                #[cfg(feature = "chaquopy")]
-                {
-                    ui.add_enabled_ui(!self.resolving(), |ui| {
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add_enabled(
-                                    !self.cookie_import_pending
-                                        && self.cookie_clear_request.is_none(),
-                                    egui::Button::new(if self.cookies_available {
-                                        "Cambiar cookies de fallback"
-                                    } else {
-                                        "Importar cookies de fallback"
-                                    }),
-                                )
-                                .clicked()
-                            {
-                                self.cookie_import_pending = true;
-                                self.cookie_poll_at = std::time::Instant::now()
-                                    + std::time::Duration::from_millis(300);
-                                self.cookie_import_request = Some(
-                                    screen::open_supported_site_cookies_file(&self.android_app),
-                                );
-                                self.cookie_notice = Some((
-                                    "Selecciona cookies.txt para YouTube, X/Twitter, Instagram o Facebook."
-                                        .to_owned(),
-                                    false,
-                                ));
-                                self.status = "Selecciona cookies.txt para YouTube, X/Twitter, Instagram o Facebook."
-                                    .to_owned();
-                            }
-                            if self.cookies_available
-                                && ui
-                                    .add_enabled(
-                                        !self.cookie_import_pending
-                                            && self.cookie_clear_request.is_none(),
-                                        egui::Button::new("Eliminar cookies guardadas"),
-                                    )
-                                    .clicked()
-                            {
-                                self.cookie_clear_request = Some(
-                                    screen::clear_supported_site_cookies(&self.android_app),
-                                );
-                            }
-                        });
-                    });
-                    if media_site(self.url.trim()) == Some(MediaSite::YouTube) {
-                        let choice = ui.add_enabled(
-                            !self.resolving(),
-                            egui::Checkbox::new(
-                                &mut self.youtube_session,
-                                "Usar mi sesion de YouTube / Music",
-                            ),
-                        );
-                        if choice.changed() {
-                            chaquopy::cancel_pending();
-                            lifecycle::invalidate_recovery();
-                            self.prefetch = prefetch::Prefetcher::default();
-                            self.stream_token = None;
-                            self.resolve_error = None;
-                            self.last_resolved_at = None;
-                        }
-                        if self.youtube_session {
-                            ui.weak("Modo cuenta: exige una sesion aceptada por YouTube; no cambia a un mix anonimo si falla.");
-                        } else {
-                            ui.weak("Los radios publicos no necesitan cuenta. Activa la sesion solo si quieres usar tu cuenta y sus recomendaciones.");
-                        }
-                        ui.weak("Listas: hasta 100 elementos por carga; los no disponibles se indican y se omiten.");
-                    }
-                    ui.weak("En modo normal: primero sin cuenta (clientes automaticos + PO Token local); si falla, cookies.");
-                    ui.weak("El fallback usa tu sesion. No oculta tu IP ni garantiza acceso a todos los enlaces.");
-                    if self.cookies_available {
-                        ui.weak("Cookies cifradas; solo para este sitio al usar sesion o fallback.");
-                    }
-                    if let Some((notice, error)) = &self.cookie_notice {
-                        if *error {
-                            ui.colored_label(egui::Color32::LIGHT_RED, notice);
-                        } else {
-                            ui.weak(notice);
-                        }
-                    }
-                }
-                ui.add_enabled_ui(!self.resolving(), |ui| {
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(&mut self.mode, PlaybackMode::Video, "Video MP4");
-                        ui.selectable_value(&mut self.mode, PlaybackMode::Audio, "Audio directo");
+                        let source_focused = !self.process_pending()
+                            && !playback.active
+                            && context.memory(|memory| {
+                                memory.has_focus(egui::Id::new("terminal_source"))
+                            });
                         #[cfg(feature = "chaquopy")]
-                        {
-                            let enabled = chaquopy::update_check_available();
-                            let button =
-                                ui.add_enabled(enabled, egui::Button::new("Actualizar yt-dlp"));
-                            if button.clicked() {
-                                if let Err(error) = chaquopy::check_update_now() {
-                                    log::error!("Buscar actualizacion de yt-dlp: {error}");
-                                    self.status = format!(
-                                        "No se pudo buscar actualizacion de yt-dlp: {error}"
-                                    );
-                                }
-                            } else if !enabled {
-                                button.on_hover_text("Comprobando actualizaciones...");
-                            }
+                        let (access_busy, account_mode) = (
+                            self.cookie_import_pending
+                                || self.cookie_clear_request.is_some()
+                                || matches!(chaquopy::warmup(), Some(chaquopy::Warmup::Pending))
+                                || chaquopy::update_check_pending(),
+                            self.session_access_active,
+                        );
+                        #[cfg(not(feature = "chaquopy"))]
+                        let (access_busy, account_mode) = (false, false);
+                        let stage = terminal::active_stage(
+                            source_focused,
+                            access_busy,
+                            playback.active && playback.error.is_none(),
+                            self.process_pending(),
+                            account_mode,
+                        );
+                        terminal::header(ui);
+                        self.draw_source(ui, stage == terminal::Stage::Source);
+                        self.draw_player_status(ui, &playback, stage == terminal::Stage::Player);
+                        if self.playing_mode == PlaybackMode::Video {
+                            let width = ui.available_width();
+                            let height = (width * 9.0 / 16.0).min(ui.available_height()).max(1.0);
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(width, height),
+                                egui::Sense::hover(),
+                            );
+                            self.draw_video(ui, rect);
                         }
-                    });
-                });
-                if self.process_pending()
-                    || (playback.active
-                        && playback.error.is_none()
-                        && (!playback.loaded || !playback.started || playback.buffering))
-                {
-                    controls::loading_bar(ui);
-                }
-                ui.label(&self.status);
-                if self.process_pending() {
-                    if let Some(started) = self.resolution_started {
-                        ui.weak(format!(
-                            "Proceso en curso: {:.0} s. Espera el resultado o cancela para probar otra URL.",
-                            started.elapsed().as_secs_f64()
-                        ));
-                    }
-                    if ui.button("Cancelar proceso y volver al player").clicked() {
-                        self.cancel_process();
-                    }
-                }
-                if !self.process_messages.is_empty() {
-                    egui::CollapsingHeader::new("Consola del proceso")
-                        .default_open(self.process_pending())
-                        .show(ui, |ui| {
-                            for message in &self.process_messages {
-                                ui.label(egui::RichText::new(message).monospace().small());
-                            }
-                        });
-                }
-                if let Some(error) = &self.video_error {
-                    ui.colored_label(egui::Color32::LIGHT_RED, format!("Video: {error}"));
-                }
-                if let Some((_, error)) = self
-                    .resolve_error
-                    .as_ref()
-                    .filter(|(input, _)| input == self.url.trim())
-                {
-                    ui.colored_label(egui::Color32::LIGHT_RED, error);
-                } else if let Some(error) = &playback.error {
-                    ui.colored_label(egui::Color32::LIGHT_RED, format!("Error: {error}"));
-                }
-                self.draw_download(ui, &playback);
-                if self.playing_mode == PlaybackMode::Video {
-                    let width = ui.available_width();
-                    let height = (width * 9.0 / 16.0).min(ui.available_height()).max(1.0);
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
-                    self.draw_video(ui, rect);
-                }
-                self.draw_history(ui);
+                        terminal::console(
+                            ui,
+                            &self.process_messages,
+                            self.process_pending(),
+                            stage == terminal::Stage::Console,
+                        );
+                        #[cfg(feature = "chaquopy")]
+                        self.draw_access_settings(ui, stage == terminal::Stage::Access);
+                        self.draw_history(ui);
                     });
             });
         if self.mpv_context != 0 {
@@ -808,6 +697,198 @@ impl eframe::App for AndroidAppState {
 
 #[cfg(target_os = "android")]
 impl AndroidAppState {
+    fn draw_source(&mut self, ui: &mut egui::Ui, active: bool) {
+        terminal::flow_panel(ui, active).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            terminal::section(ui, "01", "FUENTE");
+            ui.scope(|ui| {
+                ui.horizontal(|ui| {
+                    let url_edit = terminal::source_input(ui, &mut self.url);
+                    if ui
+                        .add_sized([70.0, 34.0], egui::Button::new("PEGAR"))
+                        .clicked()
+                    {
+                        url_edit.request_focus();
+                        match read_android_clipboard() {
+                            Ok(value) if !value.is_empty() => self.url = value,
+                            Ok(_) => self.status = "El portapapeles esta vacio".to_owned(),
+                            Err(error) => {
+                                self.status = format!("No se pudo leer el portapapeles: {error}");
+                            }
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.mode, PlaybackMode::Audio, "AUDIO");
+                    ui.selectable_value(&mut self.mode, PlaybackMode::Video, "VIDEO MP4");
+                });
+            });
+            ui.label(
+                egui::RichText::new("YouTube, X, Instagram y Facebook · acceso automatico")
+                    .small()
+                    .color(terminal::MUTED),
+            );
+        });
+    }
+
+    fn draw_player_status(
+        &mut self,
+        ui: &mut egui::Ui,
+        playback: &playback::Playback,
+        active: bool,
+    ) {
+        let pending = self.process_pending();
+        let resolve_error = self
+            .resolve_error
+            .as_ref()
+            .filter(|(input, _)| input == self.url.trim())
+            .map(|(_, error)| error.clone());
+        let (state, color) = if resolve_error.is_some() || playback.error.is_some() {
+            ("ERROR", terminal::ERROR)
+        } else if playback.paused && playback.active {
+            ("EN PAUSA", terminal::WARNING)
+        } else if playback.is_playing() {
+            ("REPRODUCIENDO", terminal::GREEN)
+        } else if pending {
+            ("RESOLVIENDO", terminal::CYAN)
+        } else if playback.loading_state() {
+            ("CARGANDO", terminal::CYAN)
+        } else {
+            ("EN ESPERA", terminal::MUTED)
+        };
+        terminal::flow_panel(ui, active).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            terminal::section(ui, "02", "REPRODUCTOR");
+            ui.label(
+                egui::RichText::new(format!("// {state}"))
+                    .monospace()
+                    .size(12.0)
+                    .color(color),
+            );
+            if playback.active && playback.playlist_count > 1 {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Pista {:02} / {:02}",
+                        playback
+                            .playlist_position
+                            .saturating_add(1)
+                            .min(playback.playlist_count),
+                        playback.playlist_count,
+                    ))
+                    .size(20.0)
+                    .strong()
+                    .color(terminal::TEXT),
+                );
+            } else if playback.active {
+                if let Some((_, _, media)) = &self.last_media {
+                    ui.label(egui::RichText::new(&media.title).size(18.0).strong());
+                    if !media.artist.is_empty() {
+                        ui.label(
+                            egui::RichText::new(&media.artist)
+                                .small()
+                                .color(terminal::MUTED),
+                        );
+                    }
+                }
+            } else if !pending && resolve_error.is_none() && playback.error.is_none() {
+                ui.label("Tu proximo stream empieza aqui.");
+            }
+            ui.label(
+                egui::RichText::new(&self.status)
+                    .small()
+                    .color(terminal::MUTED),
+            );
+            if pending || playback.loading_state() {
+                controls::loading_bar(ui);
+            }
+            if pending {
+                if let Some(started) = self.resolution_started {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "WORKER // {:.0} s",
+                            started.elapsed().as_secs_f64()
+                        ))
+                        .monospace()
+                        .size(11.0)
+                        .color(terminal::CYAN),
+                    );
+                }
+                if ui.button("CANCELAR PROCESO").clicked() {
+                    self.cancel_process();
+                }
+            }
+            if let Some(error) = &self.video_error {
+                ui.colored_label(terminal::ERROR, format!("Video: {error}"));
+            }
+            if let Some(error) = &resolve_error {
+                ui.colored_label(terminal::ERROR, error);
+            } else if let Some(error) = &playback.error {
+                ui.colored_label(terminal::ERROR, format!("Error: {error}"));
+            }
+            self.draw_download(ui, playback);
+        });
+    }
+
+    #[cfg(feature = "chaquopy")]
+    fn draw_access_settings(&mut self, ui: &mut egui::Ui, active: bool) {
+        terminal::flow_panel(ui, active).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            egui::CollapsingHeader::new(
+                egui::RichText::new("04 / ACCESO Y MOTOR").monospace().size(11.0).color(terminal::CYAN)
+            ).id_salt("access_settings").show(ui, |ui| {
+                ui.label("Acceso automatico: prueba la via mas probable y, si falla, la alternativa.");
+                ui.label("YouTube publico: sin cuenta primero. X, Instagram, Facebook y listas personales: cuenta primero si hay cookies.");
+                ui.label(egui::RichText::new(
+                    "Las cookies se guardan cifradas. No ocultan tu IP ni garantizan acceso."
+                ).small().color(terminal::MUTED));
+                ui.add_enabled_ui(!self.resolving(), |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        let enabled = !self.cookie_import_pending && self.cookie_clear_request.is_none();
+                        if ui.add_enabled(enabled, egui::Button::new(if self.cookies_available {
+                            "CAMBIAR COOKIES"
+                        } else {
+                            "IMPORTAR COOKIES"
+                        })).clicked() {
+                            self.cookie_import_pending = true;
+                            self.cookie_poll_at = std::time::Instant::now()
+                                + std::time::Duration::from_millis(300);
+                            self.cookie_import_request = Some(
+                                screen::open_supported_site_cookies_file(&self.android_app)
+                            );
+                            let message = "Selecciona cookies.txt para YouTube, X/Twitter, Instagram o Facebook.";
+                            self.cookie_notice = Some((message.to_owned(), false));
+                            self.status = message.to_owned();
+                        }
+                        if self.cookies_available && ui.add_enabled(
+                            enabled, egui::Button::new("ELIMINAR COOKIES")
+                        ).clicked() {
+                            self.cookie_clear_request = Some(
+                                screen::clear_supported_site_cookies(&self.android_app)
+                            );
+                        }
+                    });
+                    ui.separator();
+                    let enabled = chaquopy::update_check_available();
+                    let button = ui.add_enabled(enabled, egui::Button::new("ACTUALIZAR YT-DLP"));
+                    if button.clicked() {
+                        if let Err(error) = chaquopy::check_update_now() {
+                            log::error!("Buscar actualizacion de yt-dlp: {error}");
+                            self.status = format!("No se pudo buscar actualizacion de yt-dlp: {error}");
+                        }
+                    } else if !enabled {
+                        button.on_hover_text("Comprobando actualizaciones...");
+                    }
+                });
+                ui.label(egui::RichText::new(
+                    "Listas: hasta 100 elementos por carga; los no disponibles se indican y se omiten."
+                ).small().color(terminal::MUTED));
+            });
+            if let Some((notice, error)) = &self.cookie_notice {
+                ui.colored_label(if *error { terminal::ERROR } else { terminal::MUTED }, notice);
+            }
+        });
+    }
+
     #[cfg(feature = "chaquopy")]
     fn poll_cookie_auth(&mut self, context: &egui::Context) {
         let state =
@@ -933,6 +1014,7 @@ impl AndroidAppState {
                     self.cookie_import_pending = false;
                     match status.as_str() {
                         "fallback" => {
+                            self.session_access_active = true;
                             self.cookie_notice = Some((
                                 "El intento anonimo fallo; se reintenta usando tu sesion guardada."
                                     .to_owned(),
@@ -940,20 +1022,28 @@ impl AndroidAppState {
                             ));
                         }
                         "session" => {
+                            self.session_access_active = true;
                             self.cookie_notice = Some((
                                 "Resolviendo la lista con tu sesion de YouTube / Music.".to_owned(),
+                                false,
+                            ));
+                        }
+                        "public" => {
+                            self.session_access_active = false;
+                            self.cookie_notice = Some((
+                                "Reproduciendo sin cuenta. Las recomendaciones pueden ser distintas.".to_owned(),
                                 false,
                             ));
                         }
                         "imported" => {
                             self.cookies_available = true;
                             self.cookie_notice = Some((
-                                "Cookies protegidas; se usaran solo si falla el intento anonimo."
+                                "Cookies guardadas para esos sitios; se conservan las de los demas."
                                     .to_owned(),
                                 false,
                             ));
                             self.status =
-                                "Cookies protegidas; se usaran solo si falla el intento anonimo."
+                                "Cookies guardadas para esos sitios; se conservan las de los demas."
                                     .to_owned();
                         }
                         "invalid" => {
@@ -1026,7 +1116,7 @@ impl AndroidAppState {
         let unavailable = target.as_ref().err().cloned();
         let enabled =
             playback.active && playback.loaded && self.download_request.is_none() && target.is_ok();
-        let button = ui.add_enabled(enabled, egui::Button::new("Descargar medio actual"));
+        let button = ui.add_enabled(enabled, egui::Button::new("DESCARGAR MEDIO"));
         let clicked = button.clicked();
         if let Some(reason) = unavailable {
             button.on_hover_text(&reason);
@@ -1068,8 +1158,7 @@ impl AndroidAppState {
             let same_media = self
                 .last_media
                 .as_ref()
-                .is_some_and(|(input, mode, _)| input == self.url.trim() && *mode == self.mode)
-                && self.last_session == self.youtube_session;
+                .is_some_and(|(input, mode, _)| input == self.url.trim() && *mode == self.mode);
             if same_media && playback.active && playback.loaded {
                 self.run_player_command(&["set", "pause", "no"]);
             } else {
@@ -1186,20 +1275,17 @@ impl AndroidAppState {
             self.history = history::entries();
             self.history_revision = revision;
         }
-        if self.history.is_empty() {
-            return;
-        }
-        ui.separator();
+        ui.add_space(4.0);
         let mut play = None;
         let mut remove = None;
-        ui.horizontal(|ui| {
-            ui.strong("Historial");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        terminal::section(ui, "05", "ARCHIVO / HISTORIAL");
+        if !self.history.is_empty() {
+            ui.horizontal_wrapped(|ui| {
                 if self.confirm_clear {
                     if ui.small_button("Cancelar").clicked() {
                         self.confirm_clear = false;
                     }
-                    if ui.small_button("Sí, borrar").clicked() {
+                    if ui.small_button("Si, borrar").clicked() {
                         self.confirm_clear = false;
                         history::clear();
                     }
@@ -1207,48 +1293,69 @@ impl AndroidAppState {
                     self.confirm_clear = true;
                 }
             });
-        });
+        }
+        if self.history.is_empty() {
+            ui.label(
+                egui::RichText::new("Aun no hay reproducciones guardadas.")
+                    .small()
+                    .color(terminal::MUTED),
+            );
+        }
         let enabled = !self.resolving();
         for entry in &self.history {
-            ui.horizontal(|ui| {
-                if ui.small_button("🗙").on_hover_text("Quitar").clicked() {
-                    remove = Some(entry.key.clone());
-                }
-                ui.vertical(|ui| {
-                    let title = ui.add_enabled(
-                        enabled,
-                        egui::Label::new(entry.label())
-                            .truncate()
-                            .sense(egui::Sense::click()),
-                    );
-                    let duration = entry.duration.filter(|value| value.is_finite());
-                    let progress = if entry.finished() {
-                        "visto".to_owned()
-                    } else if let (Some(position), Some(duration)) =
-                        (entry.resume_position(), duration)
-                    {
-                        format!(
-                            "continuar en {} / {}",
-                            controls::clock(position),
-                            controls::clock(duration)
-                        )
-                    } else {
-                        duration.map(controls::clock).unwrap_or_default()
-                    };
-                    let mode = if entry.audio_only { "Audio" } else { "Video" };
-                    let details = [mode, entry.artist.as_str(), progress.as_str()]
-                        .into_iter()
-                        .filter(|part| !part.is_empty())
-                        .collect::<Vec<_>>()
-                        .join(" · ");
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(details).weak().small()).truncate(),
-                    );
-                    if title.clicked() {
-                        play = Some((entry.input.clone(), entry.audio_only));
-                    }
+            egui::Frame::none()
+                .fill(terminal::PANEL)
+                .rounding(4.0)
+                .inner_margin(8.0)
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        if ui
+                            .small_button("x")
+                            .on_hover_text("Quitar del historial")
+                            .clicked()
+                        {
+                            remove = Some(entry.key.clone());
+                        }
+                        ui.vertical(|ui| {
+                            let title = ui.add_enabled(
+                                enabled,
+                                egui::Label::new(entry.label())
+                                    .truncate()
+                                    .sense(egui::Sense::click()),
+                            );
+                            let duration = entry.duration.filter(|value| value.is_finite());
+                            let progress = if entry.finished() {
+                                "visto".to_owned()
+                            } else if let (Some(position), Some(duration)) =
+                                (entry.resume_position(), duration)
+                            {
+                                format!(
+                                    "continuar en {} / {}",
+                                    controls::clock(position),
+                                    controls::clock(duration)
+                                )
+                            } else {
+                                duration.map(controls::clock).unwrap_or_default()
+                            };
+                            let mode = if entry.audio_only { "Audio" } else { "Video" };
+                            let details = [mode, entry.artist.as_str(), progress.as_str()]
+                                .into_iter()
+                                .filter(|part| !part.is_empty())
+                                .collect::<Vec<_>>()
+                                .join(" · ");
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(details).color(terminal::MUTED).small(),
+                                )
+                                .truncate(),
+                            );
+                            if title.clicked() {
+                                play = Some((entry.input.clone(), entry.audio_only));
+                            }
+                        });
+                    });
                 });
-            });
         }
         if let Some(key) = remove {
             history::remove(&key);
@@ -1379,7 +1486,6 @@ impl AndroidAppState {
                 self.service_request =
                     Some(screen::start_playback_service(&self.android_app, &media));
                 self.last_media = Some((self.url.trim().to_owned(), self.mode, media));
-                self.last_session = self.youtube_session;
             }
             Err(error) => {
                 log::error!("Cargar stream: {error}");
@@ -1453,7 +1559,7 @@ impl AndroidAppState {
         }
         let audio_only = self.mode == PlaybackMode::Audio;
         if let Some((source, mode, media)) = &self.last_media {
-            if source == &input && *mode == self.mode && self.last_session == self.youtube_session {
+            if source == &input && *mode == self.mode {
                 if self.playback.lock().expect("playback lock").error.is_none()
                     && self
                         .last_resolved_at
@@ -1477,7 +1583,7 @@ impl AndroidAppState {
             let key = prefetch::Key {
                 input: input.clone(),
                 audio_only,
-                session: self.youtube_session,
+                session: false,
             };
             match self.prefetch.take(&key, std::time::Instant::now()) {
                 prefetch::Taken::Ready(media, resolved_at, receiver, _token) => {
@@ -1500,7 +1606,7 @@ impl AndroidAppState {
                 }
                 prefetch::Taken::None => {}
             }
-            match chaquopy::extract_stream_url(&input, audio_only, self.youtube_session) {
+            match chaquopy::extract_stream_url(&input, audio_only, false) {
                 Ok(receiver) => {
                     self.stream_receiver = Some(receiver);
                     self.status = "Resolviendo con yt-dlp (Chaquopy)...".to_owned();
@@ -1662,7 +1768,7 @@ impl AndroidAppState {
         if !self.resolving() {
             self.stream_token = None;
         } else {
-            // Play ya esta esperando; la URL y el modo no pueden cambiar.
+            // Play ya espera este resultado; los cambios de fuente cancelan la peticion.
             return;
         }
         let now = std::time::Instant::now();
@@ -1672,7 +1778,6 @@ impl AndroidAppState {
             .last_media
             .as_ref()
             .is_some_and(|(source, mode, _)| source == input && *mode == self.mode)
-            && self.last_session == self.youtube_session
             && (self.playback.lock().expect("playback lock").stopped
                 || self
                     .last_resolved_at
@@ -1689,7 +1794,7 @@ impl AndroidAppState {
         let key = eligible.then(|| prefetch::Key {
             input: input.to_owned(),
             audio_only,
-            session: self.youtube_session,
+            session: false,
         });
         if let Some(key) = self.prefetch.observe(key, now) {
             self.resolution_started = Some(now);
@@ -2389,6 +2494,7 @@ pub fn android_main(android_app: winit::platform::android::activity::AndroidApp)
         "VisualRustMPV",
         options,
         Box::new(move |creation| {
+            terminal::configure(&creation.egui_ctx);
             Ok(Box::new(AndroidAppState::new(
                 app_handle,
                 creation.gl.as_deref(),

@@ -114,7 +114,7 @@ _PLAYER_CACHE_LIMIT = 2
 
 # Long-lived downloaders keyed by (audio_only, runtime_path, cache_dir). Their
 # YouTube extractor keeps player code and solved n/sig challenges in memory.
-_downloaders: dict[tuple[bool, str, str | None], YoutubeDL] = {}
+_downloaders: dict[tuple[bool, str, str | None, str], YoutubeDL] = {}
 _request: tuple["ExtractionBridge", int] | None = None
 _streaming = False
 _published = False
@@ -264,7 +264,7 @@ def _failure_message(error: str | None) -> str:
 
 def _options(
     audio_only: bool, runtime_path: str, cache_dir: str | None,
-    cookie_file: str | None = None,
+    cookie_file: str | None = None, youtube: bool = True,
 ) -> dict:
     options = {
         "logger": _errors,
@@ -287,6 +287,8 @@ def _options(
     if cookie_file:
         options["cookiefile"] = cookie_file
         return options
+    if not youtube:
+        return options
     provider_options = anonymous_provider.options()
     options["js_runtimes"].update(provider_options["js_runtimes"])
     options["extractor_args"] = provider_options["extractor_args"]
@@ -297,14 +299,16 @@ def _downloader(
     audio_only: bool,
     runtime_path: str,
     cache_dir: str | None,
+    site: str = "youtube",
 ) -> YoutubeDL:
-    key = (audio_only, runtime_path, cache_dir)
+    key = (audio_only, runtime_path, cache_dir, site)
     downloader = _downloaders.get(key)
     if downloader is None:
-        if cache_dir:
+        if cache_dir and site == "youtube":
             _enable_player_cache()
-        downloader = YoutubeDL(_options(audio_only, runtime_path, cache_dir))
-        downloader.get_info_extractor("Youtube")
+        downloader = YoutubeDL(_options(audio_only, runtime_path, cache_dir, youtube=site == "youtube"))
+        if site == "youtube":
+            downloader.get_info_extractor("Youtube")
         _downloaders[key] = downloader
     return downloader
 
@@ -344,8 +348,9 @@ def _discard_downloader(
     audio_only: bool,
     runtime_path: str,
     cache_dir: str | None,
+    site: str = "youtube",
 ) -> None:
-    downloader = _downloaders.pop((audio_only, runtime_path, cache_dir), None)
+    downloader = _downloaders.pop((audio_only, runtime_path, cache_dir, site), None)
     if downloader is not None:
         try:
             downloader.close()
@@ -490,6 +495,50 @@ class CookieFallbackBridge(Protocol):
     def setSupportedSiteCookiesFallbackStatus(self, status: str) -> None: ...
 
 
+def _media_site(url: str) -> str:
+    host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    for site, domains in (
+        ("youtube", ("youtube.com", "youtube-nocookie.com", "youtu.be")),
+        ("twitter", ("x.com", "twitter.com")),
+        ("instagram", ("instagram.com", "instagr.am")),
+        ("facebook", ("facebook.com", "fb.com", "fb.watch")),
+    ):
+        if any(host == domain or host.endswith("." + domain) for domain in domains):
+            return site
+    return "other"
+
+
+def _prefer_account(url: str) -> bool:
+    site = _media_site(url)
+    if site in ("twitter", "instagram", "facebook"):
+        return True
+    if site != "youtube":
+        return False
+    parsed = urlsplit(url)
+    playlist = next((value for key, value in parse_qsl(parsed.query) if key == "list"), "")
+    if parsed.path.startswith("/browse/VL"):
+        playlist = parsed.path.removeprefix("/browse/VL")
+    public_radio = any(
+        playlist.startswith(prefix) and len(playlist.removeprefix(prefix)) == 11
+        for prefix in ("RDAMVM", "RD"))
+    return playlist in ("WL", "LL", "LM") or (playlist.startswith("RD") and not public_radio)
+
+
+def _guest_media(
+    url: str, audio_only: bool, runtime_path: str, cache_dir: str | None,
+    cookie_bridge: CookieFallbackBridge, refresh: bool,
+) -> str:
+    if refresh:
+        _discard_downloader(audio_only, runtime_path, cache_dir, _media_site(url))
+    if _media_site(url) == "youtube":
+        _progress("Preparando acceso publico a YouTube...")
+        provider_error = _interruptible(cookie_bridge.prepareAnonymousExtraction)
+        if provider_error:
+            raise RuntimeError(provider_error)
+    _progress("Resolviendo sin cuenta...")
+    return _interruptible(lambda: extract_media(url, audio_only, runtime_path, cache_dir))
+
+
 def extract_media_with_fallback(
     url: str,
     audio_only: bool,
@@ -499,21 +548,34 @@ def extract_media_with_fallback(
     cookies_only: bool = False,
     refresh: bool = False,
 ) -> str:
-    """Try the guest first; decrypt account cookies only after extraction fails."""
+    """Choose the likely access mode, then try the other once before publishing."""
     _validate_stream_url(url)
     url = _normalize_youtube_url(url)
     if cookies_only:
         _progress("Usando la sesion guardada para conservar la lista o renovar su stream...")
         return _account_media(url, audio_only, runtime_path, cache_dir, cookie_bridge)
+    if not refresh and _prefer_account(url):
+        try:
+            return _account_media(url, audio_only, runtime_path, cache_dir, cookie_bridge)
+        except (DownloadError, RuntimeError) as account_error:
+            if _published:
+                raise RuntimeError(
+                    "La cola quedo incompleta; se conservan los elementos ya resueltos. "
+                    f"No se cambia de sesion: {_clean_text(str(account_error))}"
+                ) from account_error
+            _progress("La cuenta no dio acceso; intentando sin cuenta...")
+            try:
+                result = _guest_media(url, audio_only, runtime_path, cache_dir, cookie_bridge, refresh)
+            except (DownloadError, RuntimeError) as guest_error:
+                raise RuntimeError(
+                    f"Intento con cuenta: {_clean_text(str(account_error))}. "
+                    f"Intento publico: {_clean_text(str(guest_error))}"
+                ) from guest_error
+            cookie_bridge.setSupportedSiteCookiesFallbackStatus("public")
+            _progress("Reproduciendo sin cuenta; las recomendaciones pueden ser distintas.")
+            return result
     try:
-        if refresh:
-            _discard_downloader(audio_only, runtime_path, cache_dir)
-        _progress("Preparando el intento anonimo y el proveedor local...")
-        provider_error = _interruptible(cookie_bridge.prepareAnonymousExtraction)
-        if provider_error:
-            raise RuntimeError(provider_error)
-        _progress("Resolviendo sin cuenta...")
-        return _interruptible(lambda: extract_media(url, audio_only, runtime_path, cache_dir))
+        return _guest_media(url, audio_only, runtime_path, cache_dir, cookie_bridge, refresh)
     except (DownloadError, RuntimeError) as anonymous_error:
         if _published:
             raise RuntimeError(
@@ -540,8 +602,7 @@ def _account_media(
     cookie_file = cookie_bridge.prepareSupportedSiteCookiesForFallback(url)
     if not cookie_file:
         raise RuntimeError(
-            "No hay cookies guardadas para este sitio; importa cookies.txt de tu cuenta. "
-            "No se sustituye una lista personal por recomendaciones anonimas.")
+            "No hay cookies guardadas para este sitio; importa cookies.txt de tu cuenta.")
     downloader = None
     try:
         cookie_bridge.setSupportedSiteCookiesFallbackStatus("fallback" if fallback else "session")
@@ -619,7 +680,7 @@ def _extract_media(
     started = time.monotonic()
     guest = downloader is None
     if downloader is None:
-        downloader = _downloader(audio_only, runtime_path, cache_dir)
+        downloader = _downloader(audio_only, runtime_path, cache_dir, _media_site(url))
     _errors.last = None
     try:
         info = downloader.extract_info(url, download=False)
@@ -630,7 +691,7 @@ def _extract_media(
     except BaseException:
         # Never reuse an instance whose extractor may have been left half-updated.
         if guest:
-            _discard_downloader(audio_only, runtime_path, cache_dir)
+            _discard_downloader(audio_only, runtime_path, cache_dir, _media_site(url))
         _prune_player_cache(cache_dir, keep=0)
         raise
     _prune_player_cache(cache_dir)

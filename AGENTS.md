@@ -1,5 +1,10 @@
 # Guía del proyecto
 
+## Regla de oro
+
+- RustMPV es un **wrapper en Rust (principalmente) de mpv, yt-dlp y ffmpeg**: conserva su potencia y comportamiento de Termux, PowerShell y consolas Linux/Unix, con una interfaz amigable para el usuario común.
+- Prioriza un flujo automático, claro y minimalista: una caja de URL para los sitios compatibles, fallback explícito cuando haga falta y errores comprensibles. La estética retrofuturista/ciberpunk es estilo visual, no complejidad ni simulación de procesos.
+
 ## Arquitectura
 
 - El workspace contiene `app_windows` y `app_android`; ambos comparten modelos y lógica de dominio desde `crates/core_logic`.

@@ -118,8 +118,117 @@ class RunnerTests(unittest.TestCase):
                     self.assertNotIn(credential, options)
                 self.assertFalse(options["usenetrc"])
         self.assertEqual(self.downloader.extract_info.call_count, len(urls))
-        self.assertEqual(self.factory.call_count, 1)
+        self.assertEqual(self.factory.call_count, len(urls))
         self.downloader.close.assert_not_called()
+
+    def test_social_guest_does_not_need_youtube_provider(self):
+        self.provider.options.side_effect = RuntimeError("YouTube provider unavailable")
+        self.downloader.extract_info.return_value = {"url": "https://cdn.example/public"}
+        for url in ("https://x.com/user/status/1", "https://instagram.com/reel/abc/",
+                    "https://fb.watch/abc/"):
+            bridge = self.fallback_bridge("")
+            result = self.runner.extract_media_with_fallback(
+                url, True, self.runtime_path, None, bridge)
+            self.assertEqual(json.loads(result)["url"], "https://cdn.example/public")
+            bridge.prepareAnonymousExtraction.assert_not_called()
+            bridge.setSupportedSiteCookiesFallbackStatus.assert_called_once_with("public")
+        self.provider.options.assert_not_called()
+
+    def test_automatic_access_priority_matches_site_and_list(self):
+        for url in (
+            "https://x.com/user/status/1", "https://mobile.twitter.com/user/status/1",
+            "https://instagr.am/reel/abc/", "https://fb.watch/abc/",
+            "https://youtube.com/playlist?list=WL",
+            "https://music.youtube.com/browse/VLRDMM",
+        ):
+            self.assertTrue(self.runner._prefer_account(url), url)
+        for url in (
+            "https://youtu.be/abcdefghijk",
+            "https://youtube.com/playlist?list=RD3LXr89pMU2Q",
+            "https://music.youtube.com/watch?v=abcdefghijk&list=RDAMVMabcdefghijk",
+            "https://youtube.com/playlist?list=PL123",
+            "https://instagram.com.evil.example/reel/abc/",
+        ):
+            self.assertFalse(self.runner._prefer_account(url), url)
+
+    def test_failed_automatic_access_reports_both_reasons(self):
+        bridge = self.fallback_bridge()
+        with (
+            patch.object(self.runner, "_account_media", side_effect=RuntimeError("account denied")),
+            patch.object(self.runner, "_guest_media", side_effect=RuntimeError("public denied")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "account denied.*public denied"):
+                self.runner.extract_media_with_fallback(
+                    "https://instagram.com/reel/abc/", True, self.runtime_path, None, bridge)
+        bridge.setSupportedSiteCookiesFallbackStatus.assert_not_called()
+
+    def test_cancelling_account_first_never_starts_public_fallback(self):
+        bridge = self.fallback_bridge()
+        with (
+            patch.object(self.runner, "_account_media", side_effect=self.runner.ExtractionCancelled),
+            patch.object(self.runner, "_guest_media") as guest,
+        ):
+            with self.assertRaises(self.runner.ExtractionCancelled):
+                self.runner.extract_media_with_fallback(
+                    "https://instagram.com/reel/abc/", True, self.runtime_path, None, bridge)
+        guest.assert_not_called()
+
+    def test_social_account_first_then_public_on_rejected_cookies(self):
+        for url in ("https://twitter.com/user/status/1", "https://instagram.com/reel/abc/",
+                    "https://facebook.com/user/videos/1/"):
+            with self.subTest(url=url):
+                account, guest = MagicMock(), MagicMock()
+                self.factory.side_effect = [account, guest]
+                account.extract_info.side_effect = self.download_error("login expired")
+                guest.extract_info.return_value = {"url": "https://cdn.example/public"}
+                bridge = self.fallback_bridge()
+                with patch.object(self.runner.os, "remove") as remove:
+                    result = self.runner.extract_media_with_fallback(
+                        url, True, self.runtime_path, None, bridge)
+                self.assertFalse(json.loads(result).get("used_cookies", False))
+                account.close.assert_called_once()
+                remove.assert_called_once()
+                guest.extract_info.assert_called_once_with(url, download=False)
+                bridge.setSupportedSiteCookiesFallbackStatus.assert_any_call("public")
+
+    def test_personal_account_failure_uses_public_with_notice(self):
+        account, guest = MagicMock(), MagicMock()
+        self.factory.side_effect = [account, guest]
+        account.get_info_extractor.return_value.is_authenticated = False
+        guest.extract_info.return_value = {"url": "https://cdn.example/public"}
+        bridge = self.fallback_bridge()
+        with patch.object(self.runner.os, "remove"):
+            result = self.runner.extract_media_with_fallback(
+                "https://music.youtube.com/watch?v=abcdefghijk&list=RDMM",
+                True, self.runtime_path, None, bridge)
+        self.assertEqual(json.loads(result)["url"], "https://cdn.example/public")
+        bridge.setSupportedSiteCookiesFallbackStatus.assert_any_call("public")
+        account.extract_info.assert_not_called()
+
+    def test_account_first_never_changes_session_after_publishing(self):
+        bridge = self.fallback_bridge()
+        self.runner._published = True
+        with patch.object(self.runner, "_account_media", side_effect=RuntimeError("tail failed")):
+            with self.assertRaisesRegex(RuntimeError, "No se cambia de sesion"):
+                self.runner.extract_media_with_fallback(
+                    "https://instagram.com/reel/abc/", True, self.runtime_path, None, bridge)
+        bridge.prepareAnonymousExtraction.assert_not_called()
+        self.factory.assert_not_called()
+
+    def test_site_isolation_survives_youtube_error_and_return(self):
+        youtube, instagram, replacement = MagicMock(), MagicMock(), MagicMock()
+        self.factory.side_effect = [youtube, instagram, replacement]
+        youtube.extract_info.side_effect = RuntimeError("broken YouTube state")
+        instagram.extract_info.return_value = {"url": "https://cdn.example/instagram"}
+        replacement.extract_info.return_value = {"url": "https://cdn.example/youtube"}
+        with self.assertRaisesRegex(RuntimeError, "broken YouTube"):
+            self.media("https://youtu.be/abcdefghijk", True)
+        self.assertEqual(self.media("https://instagram.com/reel/abc/", True)["url"],
+                         "https://cdn.example/instagram")
+        self.assertEqual(self.media("https://youtu.be/abcdefghijk", True)["url"],
+                         "https://cdn.example/youtube")
+        youtube.close.assert_called_once()
+        instagram.close.assert_not_called()
 
     def test_saved_cookie_argument_is_not_accepted(self):
         with self.assertRaises(TypeError):
@@ -492,7 +601,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_personal_playlist_without_cookies_never_substitutes_anonymous_mix(self):
         bridge = self.fallback_bridge("")
-        with self.assertRaisesRegex(RuntimeError, "No se sustituye una lista personal"):
+        with self.assertRaisesRegex(RuntimeError, "No hay cookies guardadas para este sitio"):
             self.runner.extract_media_with_fallback(
                 "https://music.youtube.com/playlist?list=RDMM",
                 True, self.runtime_path, None, bridge, cookies_only=True)

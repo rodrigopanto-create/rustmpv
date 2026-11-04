@@ -354,7 +354,7 @@ public final class MainActivity extends NativeActivity {
     }
 
     /** Worker-thread callback; never called by the successful anonymous attempt. */
-    public String prepareSupportedSiteCookiesForFallback(String url)
+    public synchronized String prepareSupportedSiteCookiesForFallback(String url)
             throws GeneralSecurityException, IOException {
         String host = Uri.parse(url).getHost();
         if (host == null) {
@@ -364,39 +364,15 @@ public final class MainActivity extends NativeActivity {
         if (root == null) {
             return "";
         }
-        byte[] encrypted;
-        try (FileInputStream stored = youtubeCookiesStore().openRead();
-                ByteArrayOutputStream output = new ByteArrayOutputStream()) {
-            byte[] buffer = new byte[8192];
-            int count;
-            while ((count = stored.read(buffer)) != -1) {
-                if (output.size() + count > MAX_COOKIE_FILE_BYTES + 64) {
-                    throw new IOException("El almacenamiento de cookies supera el limite");
-                }
-                output.write(buffer, 0, count);
-            }
-            encrypted = output.toByteArray();
-        } catch (FileNotFoundException error) {
-            return "";
-        }
-        byte[] contents = null;
+        byte[] contents = readStoredSiteCookies();
+        if (contents.length == 0) return "";
         byte[] filtered = null;
         try {
-            if (encrypted.length < 30 || encrypted[0] != 1 || encrypted[1] != 12) {
-                throw new IOException("El almacenamiento de cookies no tiene un formato valido");
-            }
-            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
-            cipher.init(Cipher.DECRYPT_MODE, youtubeCookiesKey(),
-                    new GCMParameterSpec(128, Arrays.copyOfRange(encrypted, 2, 14)));
-            cipher.updateAAD(COOKIE_KEY_ALIAS.getBytes(StandardCharsets.US_ASCII));
-            contents = cipher.doFinal(encrypted, 14, encrypted.length - 14);
             StringBuilder cookies = new StringBuilder("# Netscape HTTP Cookie File\n");
             boolean found = false;
             for (String line : new String(contents, StandardCharsets.UTF_8).split("\\r?\\n")) {
                 String[] fields = line.split("\\t", -1);
-                if (fields.length != 7) {
-                    continue;
-                }
+                if (fields.length != 7) continue;
                 String domain = fields[0].startsWith("#HttpOnly_")
                         ? fields[0].substring("#HttpOnly_".length()) : fields[0];
                 if (root.equals(supportedCookieRoot(domain))) {
@@ -404,9 +380,7 @@ public final class MainActivity extends NativeActivity {
                     found = true;
                 }
             }
-            if (!found) {
-                return "";
-            }
+            if (!found) return "";
             filtered = cookies.toString().getBytes(StandardCharsets.UTF_8);
             File temporary = File.createTempFile("supported-site-cookies-", ".txt", getCacheDir());
             try (FileOutputStream output = new FileOutputStream(temporary)) {
@@ -420,13 +394,42 @@ public final class MainActivity extends NativeActivity {
             }
             return temporary.getAbsolutePath();
         } finally {
-            Arrays.fill(encrypted, (byte) 0);
-            if (contents != null) Arrays.fill(contents, (byte) 0);
+            Arrays.fill(contents, (byte) 0);
             if (filtered != null) Arrays.fill(filtered, (byte) 0);
         }
     }
 
-    public String clearSupportedSiteCookies() {
+    private byte[] readStoredSiteCookies() throws GeneralSecurityException, IOException {
+        byte[] encrypted;
+        try (FileInputStream stored = youtubeCookiesStore().openRead();
+                ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+            byte[] buffer = new byte[8192];
+            int count;
+            while ((count = stored.read(buffer)) != -1) {
+                if (output.size() + count > MAX_COOKIE_FILE_BYTES + 64) {
+                    throw new IOException("El almacenamiento de cookies supera el limite");
+                }
+                output.write(buffer, 0, count);
+            }
+            encrypted = output.toByteArray();
+        } catch (FileNotFoundException error) {
+            return new byte[0];
+        }
+        try {
+            if (encrypted.length < 30 || encrypted[0] != 1 || encrypted[1] != 12) {
+                throw new IOException("El almacenamiento de cookies no tiene un formato valido");
+            }
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            cipher.init(Cipher.DECRYPT_MODE, youtubeCookiesKey(),
+                    new GCMParameterSpec(128, Arrays.copyOfRange(encrypted, 2, 14)));
+            cipher.updateAAD(COOKIE_KEY_ALIAS.getBytes(StandardCharsets.US_ASCII));
+            return cipher.doFinal(encrypted, 14, encrypted.length - 14);
+        } finally {
+            Arrays.fill(encrypted, (byte) 0);
+        }
+    }
+
+    public synchronized String clearSupportedSiteCookies() {
         AtomicFile store = youtubeCookiesStore();
         store.delete();
         if (store.getBaseFile().exists()) {
@@ -446,17 +449,22 @@ public final class MainActivity extends NativeActivity {
             youtubeCookiesStatus = "cancelled";
             return;
         }
+        Uri uri = data.getData();
+        new Thread(() -> importSiteCookies(uri), "RustMPV-cookie-import").start();
+    }
+
+    private void importSiteCookies(Uri uri) {
         byte[] contents = null;
         byte[] supportedSiteCookies = null;
         try {
-            contents = readYoutubeCookieFile(data.getData());
+            contents = readYoutubeCookieFile(uri);
             supportedSiteCookies = supportedSiteCookiesOnly(contents);
-            encryptAndStoreYoutubeCookies(supportedSiteCookies);
+            mergeAndStoreSiteCookies(supportedSiteCookies);
             youtubeCookiesStatus = "imported";
         } catch (InvalidCookieFileException error) {
             youtubeCookiesStatus = "invalid";
             Log.w("VisualRustMPV", "Archivo de cookies no valido: " + error.getMessage());
-        } catch (Exception error) {
+        } catch (GeneralSecurityException | IOException | SecurityException | IllegalStateException error) {
             youtubeCookiesStatus = "error";
             Log.e("VisualRustMPV", "No se pudieron importar las cookies", error);
         } finally {
@@ -523,23 +531,23 @@ public final class MainActivity extends NativeActivity {
     }
 
     private String supportedCookieRoot(String domain) {
-        String normalized = (domain.startsWith(".") ? domain.substring(1) : domain)
-                .toLowerCase(Locale.ROOT);
-        for (String root : new String[] {
-                "youtube.com", "youtube-nocookie.com",
-                "x.com", "twitter.com",
-                "instagram.com", "instagr.am",
-                "facebook.com", "fb.com", "fb.watch"
-        }) {
-            if (normalized.equals(root) || normalized.endsWith("." + root)) {
-                if (root.equals("youtube-nocookie.com")) return "youtube.com";
-                if (root.equals("x.com")) return "twitter.com";
-                if (root.equals("instagr.am")) return "instagram.com";
-                if (root.equals("fb.com") || root.equals("fb.watch")) return "facebook.com";
-                return root;
+        return SiteCookies.root(domain);
+    }
+
+    private synchronized void mergeAndStoreSiteCookies(byte[] imported)
+            throws GeneralSecurityException, IOException {
+        byte[] stored = readStoredSiteCookies();
+        byte[] merged = null;
+        try {
+            merged = SiteCookies.merge(stored, imported);
+            if (merged.length > MAX_COOKIE_FILE_BYTES) {
+                throw new IOException("Las cookies combinadas superan el limite");
             }
+            encryptAndStoreYoutubeCookies(merged);
+        } finally {
+            Arrays.fill(stored, (byte) 0);
+            if (merged != null) Arrays.fill(merged, (byte) 0);
         }
-        return null;
     }
 
     private void encryptAndStoreYoutubeCookies(byte[] contents)

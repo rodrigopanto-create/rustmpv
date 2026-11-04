@@ -64,6 +64,10 @@ impl Playback {
             && self.error.is_none()
     }
 
+    pub fn loading_state(&self) -> bool {
+        self.active && self.error.is_none() && (!self.loaded || !self.started || self.buffering)
+    }
+
     pub fn loading(&mut self) {
         let playlist_position = self.playlist_position;
         *self = Self {
@@ -432,6 +436,22 @@ pub use native::{error_text, subscribe};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loading_indicator_uses_observed_playback_state() {
+        let mut playback = Playback::default();
+        assert!(!playback.loading_state());
+        playback.loading();
+        assert!(playback.loading_state());
+        playback.loaded = true;
+        assert!(playback.loading_state());
+        playback.started = true;
+        assert!(!playback.loading_state());
+        playback.buffering = true;
+        assert!(playback.loading_state());
+        playback.fail("sin conexion".to_owned());
+        assert!(!playback.loading_state());
+    }
 
     #[test]
     fn playlist_navigation_respects_boundaries_and_ready_entries() {

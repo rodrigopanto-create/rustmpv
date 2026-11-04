@@ -318,7 +318,11 @@ pub fn check_update_now() -> Result<(), String> {
 }
 
 pub fn update_check_available() -> bool {
-    UPDATER.get().is_some() && !CHECKING.load(Ordering::Acquire)
+    UPDATER.get().is_some() && !update_check_pending()
+}
+
+pub fn update_check_pending() -> bool {
+    CHECKING.load(Ordering::Acquire)
 }
 
 /// Busca una version nueva de yt-dlp sin bloquear el worker; se aplica al reiniciar.

@@ -98,11 +98,19 @@ def configure(scenario):
         return _radio_urls[scenario]
     if scenario.startswith("music_compare"):
         return "https://www.youtube.com/watch?v=UsR08cY8k0A"
+    if scenario.startswith("cross_site"):
+        paths = {
+            "cross_site_twitter": "https://x.com/test/status/1",
+            "cross_site_instagram": "https://instagram.com/reel/test/",
+            "cross_site_facebook": "https://facebook.com/test/videos/1/",
+        }
+        return paths.get(scenario, "https://youtube.com/watch?v=RecoverTest1") + (
+            "&" if scenario not in paths else "?") + f"probe={scenario}"
     return f"https://www.youtube.com/watch?v=RecoverTest1&probe={scenario}"
 
 
 def extract(url, audio_only, runtime_path, cache_dir, downloader=None):
-    if "v=RecoverTest1&probe=" not in url:
+    if "v=RecoverTest1&probe=" not in url and "probe=cross_site" not in url:
         return _original_extract(url, audio_only, runtime_path, cache_dir, downloader)
     with _lock:
         _state["calls"].append("guest" if downloader is None else "cookies")
@@ -151,6 +159,8 @@ def extract(url, audio_only, runtime_path, cache_dir, downloader=None):
         "title": "Playback recovery test",
         "entry_id": "RecoverTest1",
     }
+    if scenario.startswith("cross_site"):
+        payload["url"] = _base + "/audio"
     if scenario.startswith("background") and count == 1:
         # A working first item starts the service; the second fails only after screen-off.
         payload.update(url=_base + "/short", playlist=[_base + "/denied"],
@@ -174,8 +184,8 @@ def fallback(url, audio_only, runtime_path, cache_dir, cookie_bridge,
     with _lock:
         scenario = _state.get("scenario", "")
     if scenario.startswith("music_account"):
-        if not cookies_only:
-            raise RuntimeError("Account probe requires explicit session mode")
+        # Explicit opt-in diagnostic stays strict independently of automatic UI policy.
+        cookies_only = True
 
         class AccountBridge:
             def prepareSupportedSiteCookiesForFallback(self, source):
@@ -280,7 +290,7 @@ def fallback(url, audio_only, runtime_path, cache_dir, cookie_bridge,
             _state["entries"] = len(media["entry_ids"])
             _state["done"] = True
         return result
-    if "v=RecoverTest1&probe=" in url:
+    if "v=RecoverTest1&probe=" in url or "probe=cross_site" in url:
         cookie_bridge = Bridge()
     return _original_fallback(url, audio_only, runtime_path, cache_dir, cookie_bridge,
                               cookies_only, refresh)
@@ -352,7 +362,8 @@ def clean_history(files_dir):
     history["entries"] = [
         entry for entry in history["entries"]
         if not (entry.get("title") == "Playback recovery test"
-                and "v=RecoverTest1&probe=" in entry.get("input", ""))
+                and ("v=RecoverTest1&probe=" in entry.get("input", "")
+                     or "probe=cross_site" in entry.get("input", "")))
     ]
     temporary = path + ".recovery-test"
     with open(temporary, "w", encoding="utf-8") as destination:
